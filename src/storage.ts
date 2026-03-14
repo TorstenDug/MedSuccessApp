@@ -7,6 +7,7 @@ export type Medication = {
   totalDose?: string;
   dosePerTablet?: string;
   dosePerTablet2?: string;
+  dosePerTablet2Unit?: string;
   multipleDosesPerTablet?: boolean;
   unit?: string;
   route?: string;
@@ -20,17 +21,21 @@ export type Medication = {
   // scheduled times for doses (ISO strings)
   scheduledTimes?: string[];
   // administration records for scheduled instances
-  administrationRecords?: { time: string; status: 'given' | 'missed' | 'created' | 'deleted' | 'discontinued' | 'stock-adjustment'; actualTime?: string; reason?: string }[];
+  administrationRecords?: { time: string; status: 'given' | 'missed' | 'created' | 'deleted' | 'discontinued' | 'stock-adjustment' | 'error-correction'; actualTime?: string; reason?: string; tabletsGiven?: number }[];
   // PRN (as-needed) medication
   prn?: boolean;
   // notes about the medication
   notes?: string;
   // stock level
   stock?: number;
+  // stock unit label (e.g., pens, single use injections, units, ml)
+  stockUnit?: string;
   // medication expiry date (optional, ISO string)
   expiryDate?: string;
-  // frequency type for scheduling (daily, every-second-day, weekly, fortnightly)
-  frequencyType?: 'daily' | 'every-second-day' | 'weekly' | 'fortnightly';
+  // frequency type for scheduling (daily, every-second-day, weekly, fortnightly, monthly)
+  frequencyType?: 'daily' | 'every-second-day' | 'weekly' | 'fortnightly' | 'monthly';
+  // medication course type for timeline horizon logic
+  courseType?: 'long-term' | 'short-term';
   // variable dose instructions (for medications like insulin)
   variableDoseInstructions?: string;
   // pharmacy collection tracking (optional)
@@ -38,6 +43,11 @@ export type Medication = {
   pharmacyCollectedTime?: string;
   pharmacyCollectedInitials?: string;
   pharmacyName?: string;
+  hasScriptRepeats?: boolean;
+  scriptRepeatsCount?: number;
+  prescriptionFileUri?: string;
+  scriptLocation?: 'Pharmacy file' | 'Home office' | 'Clients possession' | 'Management office' | 'Other';
+  scriptLocationOtherDetail?: string;
 };
 
 export type Client = {
@@ -45,6 +55,7 @@ export type Client = {
   name: string;
   dob?: string;
   allergies?: string;
+  additionalInfo?: string;
   medications?: Medication[];
   photoUri?: string;
   gender?: 'Male' | 'Female' | 'Other';
@@ -54,7 +65,7 @@ export type Client = {
   gpClinic?: string;
   medicareNumber?: string;
   // Archive of deleted medication administration records
-  archivedMedicationHistory?: { medName: string; records: { time: string; status: string; actualTime?: string; reason?: string }[] }[];
+  archivedMedicationHistory?: { medName: string; records: { time: string; status: string; actualTime?: string; reason?: string; tabletsGiven?: number }[] }[];
 };
 
 export type Location = {
@@ -153,7 +164,7 @@ export async function updateMedication(locationId: string, clientId: string, med
   return medication;
 }
 
-export async function addAdministrationRecord(locationId: string, clientId: string, medicationId: string, timeIso: string, status: 'given' | 'missed' | 'created' | 'deleted' | 'discontinued' | 'stock-adjustment', actualTime?: string, reason?: string) {
+export async function addAdministrationRecord(locationId: string, clientId: string, medicationId: string, timeIso: string, status: 'given' | 'missed' | 'created' | 'deleted' | 'discontinued' | 'stock-adjustment' | 'error-correction', actualTime?: string, reason?: string, tabletsGiven?: number) {
   const data = await loadData();
   const loc = data.find((l) => l.id === locationId);
   if (!loc) throw new Error('Location not found');
@@ -162,7 +173,7 @@ export async function addAdministrationRecord(locationId: string, clientId: stri
   const med = client.medications?.find((m) => m.id === medicationId);
   if (!med) throw new Error('Medication not found');
   med.administrationRecords = med.administrationRecords || [];
-  med.administrationRecords.push({ time: timeIso, status, actualTime, reason });
+  med.administrationRecords.push({ time: timeIso, status, actualTime, reason, tabletsGiven });
   await saveData(data);
   return med;
 }

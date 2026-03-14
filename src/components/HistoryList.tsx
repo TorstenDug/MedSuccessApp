@@ -2,6 +2,7 @@ import React, { useMemo } from 'react';
 import { FlatList, Text, View, TouchableOpacity, Alert } from 'react-native';
 import { Client } from '../storage';
 import { STATUS_COLORS, COLORS } from '../constants';
+import { getAdministrationTimingStatus } from '../utils/medicationTimingHelpers';
 
 type HistoryItem = {
   medName: string;
@@ -9,6 +10,7 @@ type HistoryItem = {
   status: string;
   actualTime?: string;
   reason?: string;
+  tabletsGiven?: number;
 };
 
 type Props = {
@@ -18,9 +20,19 @@ type Props = {
 };
 
 export function HistoryList({ client, styles, filteredRecords }: Props) {
+  const isErrorCorrectionReason = (reason?: string) => {
+    const text = (reason || '').toLowerCase();
+    return (
+      text.includes('error correction:') ||
+      text.includes('marked as error:') ||
+      text.includes('marked as in error')
+    );
+  };
+
   const statusColors = {
     ...STATUS_COLORS,
     'not-given': COLORS.black,
+    'error-correction': COLORS.textTertiary,
     due: COLORS.warning,
     overdue: COLORS.errorDark,
     pending: COLORS.primary,
@@ -78,12 +90,12 @@ export function HistoryList({ client, styles, filteredRecords }: Props) {
     const items: HistoryItem[] = [];
     (client.medications || []).forEach(m => {
       (m.administrationRecords || []).forEach(r =>
-        items.push({ medName: m.name, time: r.time, status: r.status, actualTime: r.actualTime, reason: r.reason })
+        items.push({ medName: m.name, time: r.time, status: r.status, actualTime: r.actualTime, reason: r.reason, tabletsGiven: r.tabletsGiven })
       );
     });
     (client.archivedMedicationHistory || []).forEach(archived => {
       (archived.records || []).forEach(r =>
-        items.push({ medName: archived.medName, time: r.time, status: r.status, actualTime: r.actualTime, reason: r.reason })
+        items.push({ medName: archived.medName, time: r.time, status: r.status, actualTime: r.actualTime, reason: r.reason, tabletsGiven: r.tabletsGiven })
       );
     });
     items.sort((a, b) => {
@@ -100,9 +112,16 @@ export function HistoryList({ client, styles, filteredRecords }: Props) {
       keyExtractor={(h, idx) => h.medName + '::' + h.time + '::' + idx}
       contentContainerStyle={styles.medList}
       renderItem={({ item, index }) => {
-        const baseTime = item.status === 'given' && item.actualTime
+        const effectiveStatus = item.status === 'missed' && isErrorCorrectionReason(item.reason)
+          ? 'error-correction'
+          : item.status;
+
+        const baseTime = effectiveStatus === 'given' && item.actualTime
           ? new Date(item.actualTime).toLocaleString()
-          : new Date(item.time).toLocaleString();
+          : effectiveStatus === 'error-correction' && item.actualTime
+            ? new Date(item.actualTime).toLocaleString()
+            : new Date(item.time).toLocaleString();
+        const originalDueTime = new Date(item.time).toLocaleString();
 
         const itemDate = new Date(item.actualTime || item.time);
         const currentDate = itemDate.toLocaleDateString();
@@ -118,22 +137,41 @@ export function HistoryList({ client, styles, filteredRecords }: Props) {
         const showDayDivider = index === 0 || prevDate !== currentDate;
         
         let displayTime = baseTime;
-        if (item.status === 'given' && item.actualTime) {
-          const scheduledTime = new Date(item.time).getTime();
-          const actualTime = new Date(item.actualTime).getTime();
-          const diffMinutes = (actualTime - scheduledTime) / (1000 * 60);
-          const timingStatus = diffMinutes <= 15 ? 'on time' : 'late';
-          displayTime = `Taken at ${baseTime} (${timingStatus})`;
+        let timingStatusLabel: 'given early' | 'given late' | 'given' | null = null;
+        if (effectiveStatus === 'given' && item.actualTime) {
+          const timingStatus = getAdministrationTimingStatus(item.time, item.actualTime);
+          if (timingStatus === 'given-early') {
+            timingStatusLabel = 'given early';
+          } else if (timingStatus === 'given-late') {
+            timingStatusLabel = 'given late';
+          } else {
+            timingStatusLabel = 'given';
+          }
+
+          const timingDisplay =
+            timingStatus === 'given-early'
+              ? 'early'
+              : timingStatus === 'given-late'
+                ? 'late'
+                : 'on time';
+          displayTime = `Taken at ${baseTime} (${timingDisplay})`;
+        }
+
+        if (effectiveStatus === 'error-correction') {
+          displayTime = `Marked in error at ${baseTime}`;
         }
         
         const receipt = extractReceiptFromReason(item.reason);
         
         let displayDetails = '';
+        const tabletsInfo = effectiveStatus === 'given' && typeof item.tabletsGiven === 'number'
+          ? ` — Tablets taken: ${item.tabletsGiven}`
+          : '';
         if (item.reason) {
           // Remove receipt data from display details
           const reasonWithoutReceipt = item.reason.replace(/ \| Receipt: data:image\/[^|]+/, '');
           if (reasonWithoutReceipt) {
-            if (item.status === 'missed') {
+            if (effectiveStatus === 'missed') {
               displayDetails = ` — Reason: ${reasonWithoutReceipt}`;
             } else {
               displayDetails = ` — ${reasonWithoutReceipt}`;
@@ -141,8 +179,16 @@ export function HistoryList({ client, styles, filteredRecords }: Props) {
           }
         }
         
-        const statusColor = statusColors[item.status as keyof typeof statusColors] || COLORS.textTertiary;
-        const displayStatus = item.status === 'stock-adjustment' ? '📦 Stock Adjustment' : item.status;
+        const isGivenLate = timingStatusLabel === 'given late';
+        const statusColor = isGivenLate
+          ? COLORS.warning
+          : (statusColors[effectiveStatus as keyof typeof statusColors] || COLORS.textTertiary);
+        const displayStatus =
+          effectiveStatus === 'stock-adjustment'
+            ? '📦 Stock Adjustment'
+            : effectiveStatus === 'error-correction'
+              ? 'Marked as in error'
+            : timingStatusLabel || effectiveStatus;
         
         return (
           <>
@@ -155,8 +201,12 @@ export function HistoryList({ client, styles, filteredRecords }: Props) {
             )}
             <View style={[styles.historyRow, { borderLeftColor: statusColor, borderLeftWidth: 4 }]}>
               <View style={{ flex: 1 }}>
-                <Text style={styles.medName}>{item.medName}</Text>
+                <Text style={styles.medName}>
+                  {item.medName}
+                  {effectiveStatus !== 'stock-adjustment' ? `  •  Due: ${originalDueTime}` : ''}
+                </Text>
                 <Text style={[styles.medTimeSmall, { color: statusColor }]}>{displayTime} — <Text style={{ fontWeight: '700', color: statusColor }}>{displayStatus}</Text>{displayDetails}</Text>
+                {tabletsInfo ? <Text style={[styles.medTimeSmall, { color: '#334155', marginTop: 2 }]}>{tabletsInfo}</Text> : null}
                 {receipt && (
                   <TouchableOpacity
                     style={{

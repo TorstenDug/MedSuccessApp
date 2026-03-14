@@ -5,11 +5,27 @@ import { Medication } from '../storage';
  * Returns: 'given' | 'missed' | 'pending' | 'overdue' | 'due' | 'upcoming'
  */
 export function getAdministrationStatus(
-  medId: string,
+  _medId: string,
   timeIso: string,
   med: Medication
 ): 'given' | 'missed' | 'pending' | 'overdue' | 'due' | 'upcoming' {
-  const record = (med.administrationRecords || []).find(r => r.time === timeIso);
+  const isLegacyErrorCorrectionMissed = (reason?: string) => {
+    const text = (reason || '').toLowerCase();
+    return (
+      text.includes('error correction:') ||
+      text.includes('marked as error:') ||
+      text.includes('marked as in error')
+    );
+  };
+
+  const timelineRecords = (med.administrationRecords || [])
+    .filter(r => {
+      if (r.time !== timeIso) return false;
+      if (r.status === 'given') return true;
+      if (r.status === 'missed') return !isLegacyErrorCorrectionMissed(r.reason);
+      return false;
+    });
+  const record = timelineRecords.length > 0 ? timelineRecords[timelineRecords.length - 1] : undefined;
   if (record) return record.status === 'given' ? 'given' : 'missed';
 
   const now = new Date();
@@ -18,7 +34,7 @@ export function getAdministrationStatus(
   const nowHour = now.getHours();
   const nowMinutes = now.getMinutes();
 
-  // For interval-based medications (every-second-day, weekly, fortnightly), show as "due" all day
+  // For interval-based medications (every-second-day, weekly, fortnightly, monthly), show as "due" all day
   if (med.frequencyType && med.frequencyType !== 'daily') {
     const medDate = t.toDateString();
     const nowDate = now.toDateString();
@@ -47,7 +63,7 @@ export function getAdministrationStatus(
     windowEnd = 10;
   } else if (medHour === 8 && t.getMinutes() === 0) {
     // Breakfast (08:00)
-    windowStart = 7;
+    windowStart = 6;
     windowEnd = 10;
   } else if (medHour === 12 && t.getMinutes() === 0) {
     // Lunch (12:00)
@@ -156,6 +172,16 @@ function formatRange(startMinutes: number, endMinutes: number): string {
   return `${start}-${end}`;
 }
 
+function parseRangeTimeToMinutes(timeText: string): number | null {
+  const match = timeText.match(/^(\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const hh = parseInt(match[1], 10);
+  const mm = parseInt(match[2], 10);
+  if (Number.isNaN(hh) || Number.isNaN(mm)) return null;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return hh * 60 + mm;
+}
+
 /**
  * Returns a display range for when a medication can be given.
  */
@@ -167,13 +193,39 @@ export function getTimeRangeLabel(timeIso: string): string {
   if (h === 0 && m === 0) return 'Any time today';
 
   if (h === 7 && m === 30) return '05:00-10:00';
-  if (h === 8 && m === 0) return '07:00-10:00';
+  if (h === 8 && m === 0) return '06:00-10:00';
   if (h === 12 && m === 0) return '10:00-15:00';
   if (h === 18 && m === 0) return '16:00-22:00';
   if (h === 22 && m === 0) return '18:00-23:59';
 
   const scheduledMinutes = h * 60 + m;
   return formatRange(scheduledMinutes - 15, scheduledMinutes + 15);
+}
+
+/**
+ * Classifies an actual administration against the configured bracket for a scheduled time.
+ */
+export function getAdministrationTimingStatus(
+  scheduledTimeIso: string,
+  actualTimeIso: string
+): 'given-early' | 'given-late' | 'given-on-time' {
+  const range = getTimeRangeLabel(scheduledTimeIso);
+  if (range === 'Any time today') return 'given-on-time';
+
+  const rangeMatch = range.match(/^(\d{2}:\d{2})-(\d{2}:\d{2})$/);
+  if (!rangeMatch) return 'given-on-time';
+
+  const startMinutes = parseRangeTimeToMinutes(rangeMatch[1]);
+  const endMinutes = parseRangeTimeToMinutes(rangeMatch[2]);
+  if (startMinutes === null || endMinutes === null) return 'given-on-time';
+
+  const actualDate = new Date(actualTimeIso);
+  if (Number.isNaN(actualDate.getTime())) return 'given-on-time';
+
+  const actualMinutes = actualDate.getHours() * 60 + actualDate.getMinutes();
+  if (actualMinutes < startMinutes) return 'given-early';
+  if (actualMinutes > endMinutes) return 'given-late';
+  return 'given-on-time';
 }
 
 /**
@@ -185,7 +237,7 @@ export function getTimeWindow(timeIso: string): { start: number; end: number } {
   const m = d.getMinutes();
 
   if (h === 7 && m === 30) return { start: 5, end: 10 };
-  if (h === 8 && m === 0) return { start: 7, end: 10 };
+  if (h === 8 && m === 0) return { start: 6, end: 10 };
   if (h === 12 && m === 0) return { start: 10, end: 15 };
   if (h === 18 && m === 0) return { start: 16, end: 22 };
   if (h === 22 && m === 0) return { start: 18, end: 24 };

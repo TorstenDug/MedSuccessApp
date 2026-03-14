@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { View, Text, FlatList, StyleSheet, TouchableOpacity, SafeAreaView, Modal, TextInput, Image } from 'react-native';
+import { View, Text, FlatList, StyleSheet, TouchableOpacity, SafeAreaView, Modal, TextInput, Image, AppState } from 'react-native';
 import { loadData, Location, Client, addLocation } from '../src/storage';
 import ClientDetailsPanel from './ClientDetailsPanel';
 import { generateTimelineDisplayItems } from '../src/utils/timelineGenerator';
@@ -14,6 +14,7 @@ export default function LocationClientsScreen({ navigation }: any) {
   const [showAddLocation, setShowAddLocation] = useState(false);
   const [newLocationName, setNewLocationName] = useState('');
   const [showLocationDropdown, setShowLocationDropdown] = useState(false);
+  const [alertStatusTick, setAlertStatusTick] = useState(Date.now());
 
   async function refresh() {
     setLoading(true);
@@ -38,6 +39,23 @@ export default function LocationClientsScreen({ navigation }: any) {
     return unsubscribe;
   }, [navigation]);
 
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      setAlertStatusTick(Date.now());
+    }, 60 * 1000);
+
+    const appStateSub = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        setAlertStatusTick(Date.now());
+      }
+    });
+
+    return () => {
+      clearInterval(intervalId);
+      appStateSub.remove();
+    };
+  }, []);
+
   const selectedLocation = locations.find(l => l.id === selectedLocationId);
   const clients = selectedLocation?.clients || [];
 
@@ -50,7 +68,7 @@ export default function LocationClientsScreen({ navigation }: any) {
       map.set(client.id, hasOverdue ? 'overdue' : hasDue ? 'due' : null);
     });
     return map;
-  }, [selectedLocation]);
+  }, [selectedLocation, alertStatusTick]);
 
   useEffect(() => {
     if (loading) return;
@@ -83,7 +101,9 @@ export default function LocationClientsScreen({ navigation }: any) {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <Image source={require('../assets/medsuccess-logo.png')} style={styles.logoLarge} />
+        <TouchableOpacity onPress={() => navigation.navigate('MarketingLanding')}>
+          <Image source={require('../assets/medsuccess-logo.png')} style={styles.logoLarge} />
+        </TouchableOpacity>
       </View>
 
       <View style={styles.splitContainer}>

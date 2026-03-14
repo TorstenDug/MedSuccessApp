@@ -1,23 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, SafeAreaView, Modal, FlatList, Alert } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, SafeAreaView, Modal } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { loadData, updateMedication, addAdministrationRecord, Medication } from '../src/storage';
 import { COLORS } from '../src/constants';
 import { safeParseInt } from '../src/validation';
 import { showError, logError } from '../src/errorHandling';
-import {
-  getCurrentDate,
-  getCurrentTime,
-  parseDateString,
-  parseTimeString,
-  formatDateFromParts,
-  formatTimeFromParts,
-  getYearsArray,
-  getMonthsArray,
-  getDaysArray,
-  getHoursArray,
-  getMinutesArray,
-} from '../src/dateTimeUtils';
+
+const SCRIPT_LOCATIONS = ['Pharmacy file', 'Home office', 'Clients possession', 'Management office', 'Other'] as const;
 
 type Props = {
   route: any;
@@ -35,28 +24,30 @@ type MedicationStockEntry = {
   verified: boolean | null;
   actualStock: string;
   notes: string;
+  scriptRepeatsCount: string;
+  prescriptionFileUri?: string;
+  scriptLocation: (typeof SCRIPT_LOCATIONS)[number] | '';
+  scriptLocationOtherDetail: string;
+  receiptBase64?: string;
+  receiptUnavailable: boolean;
+  receiptUnavailableReason: string;
 };
 
 export function StockManagementScreen({ route, navigation }: Props) {
   const { clientId, locationId, clientName } = route.params;
+
+  const usesApproximateStock = (medication: Medication): boolean => {
+    const route = String(medication.route || '').toLowerCase();
+    return route.includes('liquid') || route.includes('eye drops');
+  };
   
   const [entries, setEntries] = useState<MedicationStockEntry[]>([]);
-  const [pharmacyName, setPharmacyName] = useState('');
-  const [collectionDate, setCollectionDate] = useState(getCurrentDate());
-  const [collectionTime, setCollectionTime] = useState(getCurrentTime());
-  const [receiptUri, setReceiptUri] = useState<string | undefined>(undefined);
-  const [receiptBase64, setReceiptBase64] = useState<string | undefined>(undefined);
-  const [receiptUnavailable, setReceiptUnavailable] = useState(false);
-  const [receiptUnavailableReason, setReceiptUnavailableReason] = useState('');
-  const [showDatePicker, setShowDatePicker] = useState(false);
-  const [showTimePicker, setShowTimePicker] = useState(false);
-  const [pickerYear, setPickerYear] = useState(new Date().getFullYear());
-  const [pickerMonth, setPickerMonth] = useState(new Date().getMonth() + 1);
-  const [pickerDay, setPickerDay] = useState(new Date().getDate());
-  const [pickerHours, setPickerHours] = useState(new Date().getHours());
-  const [pickerMinutes, setPickerMinutes] = useState(new Date().getMinutes());
   const [loading, setLoading] = useState(true);
+  const [showValidationPopup, setShowValidationPopup] = useState(false);
+  const [validationPopupText, setValidationPopupText] = useState('');
   const [expandedMeds, setExpandedMeds] = useState<Record<string, boolean>>({});
+  const [showScriptLocationDropdown, setShowScriptLocationDropdown] = useState(false);
+  const [scriptLocationTargetIndex, setScriptLocationTargetIndex] = useState<number | null>(null);
 
   useEffect(() => {
     loadMedications();
@@ -83,7 +74,14 @@ export function StockManagementScreen({ route, navigation }: Props) {
           collected: '',
           verified: null,
           actualStock: '',
-          notes: ''
+          notes: '',
+          scriptRepeatsCount: med.scriptRepeatsCount?.toString() || '',
+          prescriptionFileUri: med.prescriptionFileUri,
+          scriptLocation: med.scriptLocation || '',
+          scriptLocationOtherDetail: med.scriptLocationOtherDetail || '',
+          receiptBase64: undefined,
+          receiptUnavailable: false,
+          receiptUnavailableReason: '',
         }));
         setEntries(medicationEntries);
       }
@@ -103,36 +101,7 @@ export function StockManagementScreen({ route, navigation }: Props) {
     });
   }
 
-  function openDatePicker() {
-    const parsed = parseDateString(collectionDate);
-    if (parsed) {
-      setPickerYear(parsed.year);
-      setPickerMonth(parsed.month);
-      setPickerDay(parsed.day);
-    }
-    setShowDatePicker(true);
-  }
-
-  function confirmDatePicker() {
-    setCollectionDate(formatDateFromParts(pickerYear, pickerMonth, pickerDay));
-    setShowDatePicker(false);
-  }
-
-  function openTimePicker() {
-    const parsed = parseTimeString(collectionTime);
-    if (parsed) {
-      setPickerHours(parsed.hours);
-      setPickerMinutes(parsed.minutes);
-    }
-    setShowTimePicker(true);
-  }
-
-  function confirmTimePicker() {
-    setCollectionTime(formatTimeFromParts(pickerHours, pickerMinutes));
-    setShowTimePicker(false);
-  }
-
-  async function pickReceiptFile() {
+  async function pickReceiptFile(index: number) {
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
@@ -144,8 +113,9 @@ export function StockManagementScreen({ route, navigation }: Props) {
       
       if (!result.canceled && result.assets && result.assets[0]?.base64) {
         const base64Uri = `data:image/jpeg;base64,${result.assets[0].base64}`;
-        setReceiptBase64(base64Uri);
-        setReceiptUri(result.assets[0].uri);
+        updateEntry(index, 'receiptBase64', base64Uri);
+        updateEntry(index, 'receiptUnavailable', false);
+        updateEntry(index, 'receiptUnavailableReason', '');
       }
     } catch (e) {
       console.error('Error picking receipt:', e);
@@ -153,81 +123,79 @@ export function StockManagementScreen({ route, navigation }: Props) {
     }
   }
 
+  async function pickPrescriptionFile(index: number) {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        quality: 0.8,
+        base64: true,
+      });
+
+      if (!result.canceled && result.assets && result.assets[0]?.base64) {
+        const base64Uri = `data:image/jpeg;base64,${result.assets[0].base64}`;
+        updateEntry(index, 'prescriptionFileUri', base64Uri);
+      }
+    } catch (e) {
+      showError(e, 'Failed to select prescription file');
+    }
+  }
+
+  function openScriptLocationDropdown(index: number) {
+    setScriptLocationTargetIndex(index);
+    setShowScriptLocationDropdown(true);
+  }
+
+  function selectScriptLocation(location: (typeof SCRIPT_LOCATIONS)[number]) {
+    if (scriptLocationTargetIndex !== null) {
+      updateEntry(scriptLocationTargetIndex, 'scriptLocation', location);
+      if (location !== 'Other') {
+        updateEntry(scriptLocationTargetIndex, 'scriptLocationOtherDetail', '');
+      }
+    }
+    setShowScriptLocationDropdown(false);
+    setScriptLocationTargetIndex(null);
+  }
+
   async function handleSubmit() {
-    const hasStockMovement = entries.some((entry) => {
-      const disposed = safeParseInt(entry.disposed, 0);
-      const wasted = safeParseInt(entry.wasted, 0);
-      const collected = safeParseInt(entry.collected, 0);
-      return disposed > 0 || wasted > 0 || collected > 0;
-    });
+    const validationIssues: string[] = [];
 
-    const hasTransferOrDisposal = entries.some((entry) => {
-      const disposed = safeParseInt(entry.disposed, 0);
-      return disposed > 0;
-    });
-
-    if (hasTransferOrDisposal && !receiptBase64 && !receiptUnavailable) {
-      showError('Please upload a transfer/disposal receipt or mark it as unavailable.', 'Required Field');
-      return;
-    }
-
-    if (hasTransferOrDisposal && receiptUnavailable && !receiptUnavailableReason.trim()) {
-      showError('Please provide a reason for missing transfer/disposal receipt.', 'Required Field');
-      return;
-    }
-
-    if (hasStockMovement && !collectionDate.trim()) {
-      showError(
-        'Please select a stock movement date at the top of the screen.',
-        'Required Field'
-      );
-      return;
-    }
-
-    if (hasStockMovement && !collectionTime.trim()) {
-      showError(
-        'Please select a stock movement time at the top of the screen.',
-        'Required Field'
-      );
-      return;
-    }
-
-    for (let i = 0; i < entries.length; i++) {
+    for (let i = 0; i < entries.length; i += 1) {
       const entry = entries[i];
       const wasted = safeParseInt(entry.wasted, 0);
       const disposed = safeParseInt(entry.disposed, 0);
+      const collected = safeParseInt(entry.collected, 0);
+
       if (wasted > 0 && !entry.wastedReason.trim()) {
-        showError(
-          `Please describe what happened for wasted stock on ${entry.medication.name}`,
-          'Required Field'
-        );
-        return;
+        validationIssues.push(`${entry.medication.name}: enter wasted reason.`);
       }
 
-      if (disposed > 0 && entry.transferTo === 'individual' && !entry.transferRecipient.trim()) {
-        showError(
-          `Please enter who the disposal/transfer was to for ${entry.medication.name}`,
-          'Required Field'
-        );
-        return;
+      if ((disposed > 0 || collected > 0) && !entry.transferRecipient.trim()) {
+        validationIssues.push(`${entry.medication.name}: enter organisation/pharmacy/individual name.`);
       }
-      
-      if (entry.verified === false) {
-        if (!entry.actualStock.trim()) {
-          showError(
-            `Please enter actual stock count for ${entry.medication.name}`,
-            'Required Field'
-          );
-          return;
-        }
-        if (!entry.notes.trim()) {
-          showError(
-            `Please enter discrepancy notes for ${entry.medication.name}`,
-            'Required Field'
-          );
-          return;
-        }
+
+      if (disposed > 0 && !entry.receiptBase64 && !entry.receiptUnavailable) {
+        validationIssues.push(`${entry.medication.name}: upload transfer/disposal/collection receipt or mark as unavailable.`);
       }
+
+      if (disposed > 0 && entry.receiptUnavailable && !entry.receiptUnavailableReason.trim()) {
+        validationIssues.push(`${entry.medication.name}: provide reason for missing transfer/disposal/collection receipt.`);
+      }
+
+      if (entry.verified === false && !entry.actualStock.trim()) {
+        validationIssues.push(`${entry.medication.name}: enter actual stock count.`);
+      }
+
+      if (entry.verified === false && !entry.notes.trim()) {
+        validationIssues.push(`${entry.medication.name}: enter discrepancy notes.`);
+      }
+    }
+
+    if (validationIssues.length > 0) {
+      const message = validationIssues.map(issue => `- ${issue}`).join('\n');
+      setValidationPopupText(message);
+      setShowValidationPopup(true);
+      return;
     }
     
     try {
@@ -241,13 +209,19 @@ export function StockManagementScreen({ route, navigation }: Props) {
         const hasVerification = entry.verified !== null;
         const hasActualStockInput = entry.actualStock.trim().length > 0;
         const hasNotes = entry.notes.trim().length > 0;
+        const scriptRepeatsCountChanged = safeParseInt(entry.scriptRepeatsCount, -1) !== (entry.medication.scriptRepeatsCount ?? -1);
+        const prescriptionFileChanged = (entry.prescriptionFileUri || '') !== (entry.medication.prescriptionFileUri || '');
+        const scriptLocationChanged = (entry.scriptLocation || '') !== (entry.medication.scriptLocation || '');
+        const scriptLocationOtherDetailChanged = (entry.scriptLocationOtherDetail || '') !== (entry.medication.scriptLocationOtherDetail || '');
+        const hasScriptChange = !!entry.medication.hasScriptRepeats && (scriptRepeatsCountChanged || prescriptionFileChanged || scriptLocationChanged || scriptLocationOtherDetailChanged);
         const hasAnyChange =
           disposed !== 0 ||
           wasted !== 0 ||
           collected !== 0 ||
           hasVerification ||
           hasActualStockInput ||
-          hasNotes;
+          hasNotes ||
+          hasScriptChange;
 
         if (!hasAnyChange) continue;
         
@@ -260,33 +234,51 @@ export function StockManagementScreen({ route, navigation }: Props) {
 
         const stockChanged = newStock !== previousStock;
         
-        if (stockChanged) {
-          const updatedMed = { ...entry.medication, stock: newStock };
+        if (stockChanged || hasScriptChange) {
+          const updatedMed = {
+            ...entry.medication,
+            stock: newStock,
+            scriptRepeatsCount: entry.medication.hasScriptRepeats
+              ? (entry.scriptRepeatsCount.trim() ? safeParseInt(entry.scriptRepeatsCount, 0) : undefined)
+              : entry.medication.scriptRepeatsCount,
+            prescriptionFileUri: entry.medication.hasScriptRepeats
+              ? entry.prescriptionFileUri
+              : entry.medication.prescriptionFileUri,
+            scriptLocation: entry.medication.hasScriptRepeats
+              ? (entry.scriptLocation || undefined)
+              : entry.medication.scriptLocation,
+            scriptLocationOtherDetail: entry.medication.hasScriptRepeats && entry.scriptLocation === 'Other'
+              ? (entry.scriptLocationOtherDetail.trim() || undefined)
+              : undefined,
+          };
           await updateMedication(locationId, clientId, updatedMed);
         }
         
         const details = [
-          `Current: ${previousStock}`,
+          `${usesApproximateStock(entry.medication) ? 'Current (approx.)' : 'Current'}: ${previousStock}`,
           disposed > 0 ? `Disposed/Transferred: ${disposed}` : null,
           disposed > 0 && entry.transferTo ? `Transfer To: ${entry.transferTo}` : null,
-          disposed > 0 && entry.transferTo === 'individual' && entry.transferRecipient.trim()
-            ? `Recipient: ${entry.transferRecipient.trim()}`
+          (disposed > 0 || collected > 0) && entry.transferRecipient.trim()
+            ? `Organisation/Pharmacy/Individual: ${entry.transferRecipient.trim()}`
             : null,
           wasted > 0 ? `Wasted: ${wasted}` : null,
           wasted > 0 && entry.wastedReason.trim() ? `Wasted Reason: ${entry.wastedReason.trim()}` : null,
           collected > 0 ? `Collected: ${collected}` : null,
-          (disposed > 0 || collected > 0) && pharmacyName.trim() ? `Pharmacy: ${pharmacyName.trim()}` : null,
-          (disposed > 0 || wasted > 0 || collected > 0) && collectionDate.trim() ? `Date: ${collectionDate.trim()}` : null,
-          (disposed > 0 || wasted > 0 || collected > 0) && collectionTime.trim() ? `Time: ${collectionTime.trim()}` : null,
-          `New: ${newStock}`,
+          `${usesApproximateStock(entry.medication) ? 'New (approx.)' : 'New'}: ${newStock}`,
           stockChanged ? `Change: ${newStock - previousStock}` : 'Change: 0',
           entry.verified === true ? 'Verified: Match' : entry.verified === false ? 'Verified: Mismatch' : null,
           entry.verified === false && entry.actualStock.trim() ? `Actual Count: ${entry.actualStock.trim()}` : null,
           entry.notes ? `Notes: ${entry.notes}` : null,
-          disposed > 0 && receiptBase64 ? `Receipt: ${receiptBase64}` : null,
-          disposed > 0 && receiptUnavailable ? 'Receipt: Unavailable' : null,
-          disposed > 0 && receiptUnavailable && receiptUnavailableReason.trim()
-            ? `Receipt Unavailable Reason: ${receiptUnavailableReason.trim()}`
+          hasScriptChange && entry.medication.hasScriptRepeats ? `Script Repeats: ${entry.scriptRepeatsCount.trim() || 'Not set'}` : null,
+          hasScriptChange && entry.medication.hasScriptRepeats ? `Script Location: ${entry.scriptLocation || 'Not set'}` : null,
+          hasScriptChange && entry.medication.hasScriptRepeats && entry.scriptLocation === 'Other' && entry.scriptLocationOtherDetail.trim()
+            ? `Script Location Other: ${entry.scriptLocationOtherDetail.trim()}`
+            : null,
+          hasScriptChange && entry.medication.hasScriptRepeats && entry.prescriptionFileUri ? 'Prescription File: Uploaded' : null,
+          (disposed > 0 || collected > 0) && entry.receiptBase64 ? `Receipt: ${entry.receiptBase64}` : null,
+          (disposed > 0 || collected > 0) && entry.receiptUnavailable ? 'Receipt: Unavailable' : null,
+          (disposed > 0 || collected > 0) && entry.receiptUnavailable && entry.receiptUnavailableReason.trim()
+            ? `Receipt Unavailable Reason: ${entry.receiptUnavailableReason.trim()}`
             : null
         ].filter(Boolean).join(' | ');
         
@@ -336,80 +328,6 @@ export function StockManagementScreen({ route, navigation }: Props) {
       <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Medications</Text>
-          <View style={styles.field}>
-            <Text style={styles.adjLabel}>Pharmacy Name (Optional)</Text>
-            <TextInput
-              style={styles.adjInput}
-              placeholder="e.g. City Pharmacy"
-              placeholderTextColor={COLORS.textPlaceholder}
-              value={pharmacyName}
-              onChangeText={setPharmacyName}
-            />
-          </View>
-
-          <View style={styles.adjustmentRow}>
-            <View style={[styles.field, { flex: 1, marginRight: 8 }]}>
-              <Text style={styles.adjLabel}>Stock Movement Date</Text>
-              <TouchableOpacity style={styles.pickerButton} onPress={openDatePicker}>
-                <Text style={styles.pickerButtonText}>{collectionDate}</Text>
-              </TouchableOpacity>
-            </View>
-            <View style={[styles.field, { flex: 1, marginLeft: 8 }]}>
-              <Text style={styles.adjLabel}>Stock Movement Time</Text>
-              <TouchableOpacity style={styles.pickerButton} onPress={openTimePicker}>
-                <Text style={styles.pickerButtonText}>{collectionTime}</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-
-          <View style={styles.field}>
-            <Text style={styles.adjLabel}>
-              📋 Receipt of Disposal / Transfer {receiptBase64 ? '✓' : '(Optional)'}
-            </Text>
-            <TouchableOpacity
-              style={[
-                styles.receiptUploadButton,
-                receiptBase64 && { backgroundColor: COLORS.successLight, borderColor: COLORS.success }
-              ]}
-              onPress={pickReceiptFile}
-            >
-              <Text
-                style={[
-                  styles.receiptUploadText,
-                  receiptBase64 && { color: COLORS.successDark, fontWeight: '700' }
-                ]}
-              >
-                {receiptBase64 ? '✓ Receipt Uploaded' : '+ Upload Receipt Image'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.field}>
-            <TouchableOpacity
-              style={styles.receiptUnavailableRow}
-              onPress={() => setReceiptUnavailable((prev) => !prev)}
-            >
-              <View style={[styles.receiptCheckbox, receiptUnavailable && styles.receiptCheckboxChecked]}>
-                {receiptUnavailable ? <Text style={styles.receiptCheckboxTick}>✓</Text> : null}
-              </View>
-              <Text style={styles.receiptUnavailableText}>Unable to supply transfer form</Text>
-            </TouchableOpacity>
-          </View>
-
-          {receiptUnavailable && (
-            <View style={styles.field}>
-              <Text style={styles.adjLabel}>Reason (Required)</Text>
-              <TextInput
-                style={[styles.adjInput, { minHeight: 60, textAlignVertical: 'top', paddingTop: 8 }]}
-                placeholder="e.g. Pharmacy did not provide a receipt"
-                placeholderTextColor={COLORS.textPlaceholder}
-                value={receiptUnavailableReason}
-                onChangeText={setReceiptUnavailableReason}
-                multiline
-                numberOfLines={2}
-              />
-            </View>
-          )}
           
           {entries.length === 0 ? (
             <Text style={styles.noMedsText}>No medications for this client</Text>
@@ -420,6 +338,7 @@ export function StockManagementScreen({ route, navigation }: Props) {
               const wasted = safeParseInt(entry.wasted, 0);
               const collected = safeParseInt(entry.collected, 0);
               const projectedStock = Math.max(0, currentStock - disposed - wasted + collected);
+              const isApproximate = usesApproximateStock(entry.medication);
               
               const isExpanded = !!expandedMeds[entry.medication.id];
               const strengthLabel = entry.medication.totalDose || 'N/A';
@@ -438,12 +357,58 @@ export function StockManagementScreen({ route, navigation }: Props) {
                       <Text style={styles.medStrength}>Strength: {strengthLabel}</Text>
                     </View>
                     <View style={styles.stockHeaderValues}>
-                      <Text style={styles.currentStock}>Current: {currentStock}</Text>
+                      <Text style={styles.currentStock}>{isApproximate ? `Current: approx. ${currentStock}` : `Current: ${currentStock}`}</Text>
                     </View>
                   </TouchableOpacity>
 
                   {isExpanded && (
                     <View>
+                      {entry.medication.hasScriptRepeats && (
+                        <View style={[styles.field, { backgroundColor: COLORS.primaryLight, borderWidth: 1, borderColor: COLORS.primary, borderRadius: 8, padding: 10 }]}> 
+                          <Text style={[styles.adjLabel, { color: COLORS.primary, fontWeight: '700' }]}>Script Repeat Details</Text>
+                          <TextInput
+                            style={styles.adjInput}
+                            placeholder="Number of script repeats (optional)"
+                            placeholderTextColor={COLORS.textPlaceholder}
+                            keyboardType="number-pad"
+                            value={entry.scriptRepeatsCount}
+                            onChangeText={(text) => updateEntry(index, 'scriptRepeatsCount', text.replace(/[^0-9]/g, ''))}
+                          />
+                          <TouchableOpacity
+                            style={[styles.pickerButton, { marginTop: 8 }]}
+                            onPress={() => openScriptLocationDropdown(index)}
+                          >
+                            <Text style={styles.pickerButtonText}>{entry.scriptLocation || 'Select script location (if known)'}</Text>
+                          </TouchableOpacity>
+                          {entry.scriptLocation === 'Other' && (
+                            <TextInput
+                              style={[styles.adjInput, { marginTop: 8 }]}
+                              placeholder="Please specify"
+                              placeholderTextColor={COLORS.textPlaceholder}
+                              value={entry.scriptLocationOtherDetail}
+                              onChangeText={(text) => updateEntry(index, 'scriptLocationOtherDetail', text)}
+                            />
+                          )}
+                          <TouchableOpacity
+                            style={[
+                              styles.receiptUploadButton,
+                              { marginTop: 8 },
+                              entry.prescriptionFileUri && { backgroundColor: COLORS.successLight, borderColor: COLORS.success }
+                            ]}
+                            onPress={() => pickPrescriptionFile(index)}
+                          >
+                            <Text
+                              style={[
+                                styles.receiptUploadText,
+                                entry.prescriptionFileUri && { color: COLORS.successDark, fontWeight: '700' }
+                              ]}
+                            >
+                              {entry.prescriptionFileUri ? '✓ Prescription File Uploaded' : '+ Upload Prescription File'}
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+                      )}
+
                       <View style={styles.adjustmentRow}>
                     <View style={[styles.field, { flex: 1, marginRight: 8 }]}>
                       <Text style={styles.adjLabel}>Disposed/Transferred</Text>
@@ -509,12 +474,12 @@ export function StockManagementScreen({ route, navigation }: Props) {
                     </View>
                   </View>
 
-                  {entry.transferTo === 'individual' && (
+                  {(disposed > 0 || collected > 0) && (
                     <View style={styles.field}>
-                      <Text style={styles.adjLabel}>Who was it transferred to?</Text>
+                      <Text style={styles.adjLabel}>Organisation / Pharmacy / Individual Name *</Text>
                       <TextInput
                         style={styles.adjInput}
-                        placeholder="e.g. John Smith, ABC Support"
+                        placeholder="e.g. City Pharmacy, ABC Support, John Smith"
                         placeholderTextColor={COLORS.textPlaceholder}
                         value={entry.transferRecipient}
                         onChangeText={(text) => updateEntry(index, 'transferRecipient', text)}
@@ -522,9 +487,56 @@ export function StockManagementScreen({ route, navigation }: Props) {
                     </View>
                   )}
 
+                  {(disposed > 0 || collected > 0) && (
+                    <View style={[styles.field, { backgroundColor: COLORS.gray50, borderWidth: 1, borderColor: COLORS.gray200, borderRadius: 8, padding: 10 }]}>
+                      <Text style={styles.adjLabel}>Receipt of Transfer / Disposal / Collection</Text>
+                      <TouchableOpacity
+                        style={[
+                          styles.receiptUploadButton,
+                          entry.receiptBase64 && { backgroundColor: COLORS.successLight, borderColor: COLORS.success }
+                        ]}
+                        onPress={() => pickReceiptFile(index)}
+                      >
+                        <Text
+                          style={[
+                            styles.receiptUploadText,
+                            entry.receiptBase64 && { color: COLORS.successDark, fontWeight: '700' }
+                          ]}
+                        >
+                          {entry.receiptBase64 ? '✓ Receipt Uploaded' : '+ Upload Receipt Image'}
+                        </Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity
+                        style={[styles.receiptUnavailableRow, { marginTop: 10 }]}
+                        onPress={() => updateEntry(index, 'receiptUnavailable', !entry.receiptUnavailable)}
+                      >
+                        <View style={[styles.receiptCheckbox, entry.receiptUnavailable && styles.receiptCheckboxChecked]}>
+                          {entry.receiptUnavailable ? <Text style={styles.receiptCheckboxTick}>✓</Text> : null}
+                        </View>
+                        <Text style={styles.receiptUnavailableText}>Unable to supply transfer form</Text>
+                      </TouchableOpacity>
+
+                      {entry.receiptUnavailable && (
+                        <View style={{ marginTop: 8 }}>
+                          <Text style={styles.adjLabel}>Reason (Required)</Text>
+                          <TextInput
+                            style={[styles.adjInput, { minHeight: 60, textAlignVertical: 'top', paddingTop: 8 }]}
+                            placeholder="e.g. Receipt not provided"
+                            placeholderTextColor={COLORS.textPlaceholder}
+                            value={entry.receiptUnavailableReason}
+                            onChangeText={(text) => updateEntry(index, 'receiptUnavailableReason', text)}
+                            multiline
+                            numberOfLines={2}
+                          />
+                        </View>
+                      )}
+                    </View>
+                  )}
+
                       <View style={styles.field}>
                         <Text style={styles.adjLabel}>Projected New Stock</Text>
-                        <Text style={styles.projectedStockValue}>New: {projectedStock}</Text>
+                        <Text style={styles.projectedStockValue}>{isApproximate ? `New: approx. ${projectedStock}` : `New: ${projectedStock}`}</Text>
                       </View>
 
                   <View style={styles.field}>
@@ -657,120 +669,36 @@ export function StockManagementScreen({ route, navigation }: Props) {
         </View>
       </ScrollView>
 
-      <Modal visible={showDatePicker} transparent animationType="fade">
-        <View style={styles.pickerOverlay}>
-          <View style={styles.pickerModal}>
-            <Text style={styles.pickerTitle}>Select Date</Text>
-            <View style={styles.pickerSelectors}>
-              <View style={styles.selectorColumn}>
-                <Text style={styles.selectorLabel}>Year</Text>
-                <FlatList
-                  data={getYearsArray(2020, 2076)}
-                  keyExtractor={(item) => item.toString()}
-                  renderItem={({ item }) => (
-                    <TouchableOpacity
-                      onPress={() => setPickerYear(item)}
-                      style={[styles.selectorItem, pickerYear === item && styles.selectorItemActive]}
-                    >
-                      <Text style={[styles.selectorItemText, pickerYear === item && styles.selectorItemTextActive]}>{item}</Text>
-                    </TouchableOpacity>
-                  )}
-                  style={styles.pickerList}
-                />
-              </View>
-              <View style={styles.selectorColumn}>
-                <Text style={styles.selectorLabel}>Month</Text>
-                <FlatList
-                  data={getMonthsArray().map((month, index) => ({ label: month, value: index + 1 }))}
-                  keyExtractor={(item) => item.value.toString()}
-                  renderItem={({ item }) => (
-                    <TouchableOpacity
-                      onPress={() => setPickerMonth(item.value)}
-                      style={[styles.selectorItem, pickerMonth === item.value && styles.selectorItemActive]}
-                    >
-                      <Text style={[styles.selectorItemText, pickerMonth === item.value && styles.selectorItemTextActive]}>{item.label}</Text>
-                    </TouchableOpacity>
-                  )}
-                  style={styles.pickerList}
-                />
-              </View>
-              <View style={styles.selectorColumn}>
-                <Text style={styles.selectorLabel}>Day</Text>
-                <FlatList
-                  data={getDaysArray(pickerYear, pickerMonth)}
-                  keyExtractor={(item) => item.toString()}
-                  renderItem={({ item }) => (
-                    <TouchableOpacity
-                      onPress={() => setPickerDay(item)}
-                      style={[styles.selectorItem, pickerDay === item && styles.selectorItemActive]}
-                    >
-                      <Text style={[styles.selectorItemText, pickerDay === item && styles.selectorItemTextActive]}>{item}</Text>
-                    </TouchableOpacity>
-                  )}
-                  style={styles.pickerList}
-                />
-              </View>
-            </View>
-            <View style={styles.pickerActions}>
-              <TouchableOpacity style={[styles.pickerActionButton, styles.pickerCancel]} onPress={() => setShowDatePicker(false)}>
-                <Text style={styles.pickerActionText}>Cancel</Text>
+      <Modal
+        visible={showScriptLocationDropdown}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setShowScriptLocationDropdown(false);
+          setScriptLocationTargetIndex(null);
+        }}
+      >
+        <TouchableOpacity
+          style={styles.pickerOverlay}
+          activeOpacity={1}
+          onPress={() => {
+            setShowScriptLocationDropdown(false);
+            setScriptLocationTargetIndex(null);
+          }}
+        >
+          <View style={[styles.pickerModal, { maxWidth: 420 }]}> 
+            <Text style={styles.pickerTitle}>Select Script Location</Text>
+            {SCRIPT_LOCATIONS.map((location) => (
+              <TouchableOpacity
+                key={location}
+                style={styles.dropdownItem}
+                onPress={() => selectScriptLocation(location)}
+              >
+                <Text style={styles.dropdownItemText}>{location}</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.pickerActionButton, styles.pickerConfirm]} onPress={confirmDatePicker}>
-                <Text style={[styles.pickerActionText, { color: COLORS.white }]}>Confirm</Text>
-              </TouchableOpacity>
-            </View>
+            ))}
           </View>
-        </View>
-      </Modal>
-
-      <Modal visible={showTimePicker} transparent animationType="slide">
-        <View style={styles.pickerOverlay}>
-          <View style={styles.pickerModal}>
-            <Text style={styles.pickerTitle}>Select Time</Text>
-            <View style={styles.pickerSelectors}>
-              <View style={styles.selectorColumn}>
-                <Text style={styles.selectorLabel}>Hours</Text>
-                <FlatList
-                  data={getHoursArray()}
-                  keyExtractor={(item) => item.toString()}
-                  renderItem={({ item }) => (
-                    <TouchableOpacity
-                      onPress={() => setPickerHours(item)}
-                      style={[styles.selectorItem, pickerHours === item && styles.selectorItemActive]}
-                    >
-                      <Text style={[styles.selectorItemText, pickerHours === item && styles.selectorItemTextActive]}>{String(item).padStart(2, '0')}</Text>
-                    </TouchableOpacity>
-                  )}
-                  style={styles.pickerList}
-                />
-              </View>
-              <View style={styles.selectorColumn}>
-                <Text style={styles.selectorLabel}>Minutes</Text>
-                <FlatList
-                  data={getMinutesArray()}
-                  keyExtractor={(item) => item.toString()}
-                  renderItem={({ item }) => (
-                    <TouchableOpacity
-                      onPress={() => setPickerMinutes(item)}
-                      style={[styles.selectorItem, pickerMinutes === item && styles.selectorItemActive]}
-                    >
-                      <Text style={[styles.selectorItemText, pickerMinutes === item && styles.selectorItemTextActive]}>{String(item).padStart(2, '0')}</Text>
-                    </TouchableOpacity>
-                  )}
-                  style={styles.pickerList}
-                />
-              </View>
-            </View>
-            <View style={styles.pickerActions}>
-              <TouchableOpacity style={[styles.pickerActionButton, styles.pickerCancel]} onPress={() => setShowTimePicker(false)}>
-                <Text style={styles.pickerActionText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.pickerActionButton, styles.pickerConfirm]} onPress={confirmTimePicker}>
-                <Text style={[styles.pickerActionText, { color: COLORS.white }]}>Confirm</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
+        </TouchableOpacity>
       </Modal>
 
       <View style={styles.footer}>
@@ -778,6 +706,30 @@ export function StockManagementScreen({ route, navigation }: Props) {
           <Text style={styles.submitButtonText}>Update Stock</Text>
         </TouchableOpacity>
       </View>
+
+      <Modal
+        visible={showValidationPopup}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowValidationPopup(false)}
+      >
+        <View style={styles.pickerOverlay}>
+          <View style={[styles.pickerModal, { maxWidth: 460 }]}> 
+            <Text style={styles.pickerTitle}>Cannot Save: Missing Information</Text>
+            <ScrollView style={{ maxHeight: 280 }}>
+              <Text style={{ fontSize: 13, lineHeight: 20, color: COLORS.textSecondary }}>{validationPopupText}</Text>
+            </ScrollView>
+            <View style={styles.pickerActions}>
+              <TouchableOpacity
+                style={[styles.pickerActionButton, styles.pickerConfirm]}
+                onPress={() => setShowValidationPopup(false)}
+              >
+                <Text style={[styles.pickerActionText, { color: COLORS.white }]}>OK</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -796,12 +748,20 @@ const styles = StyleSheet.create({
   title: { fontSize: 22, fontWeight: '700', color: COLORS.textPrimary },
   clientName: { fontSize: 14, color: COLORS.textSecondary, marginTop: 4 },
   content: { flex: 1 },
-  contentContainer: { paddingBottom: 20 },
-  section: { paddingHorizontal: 16, paddingTop: 16 },
+  contentContainer: { padding: 16, paddingBottom: 20, alignItems: 'center' },
+  section: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: COLORS.gray50,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.gray200,
+    padding: 14,
+  },
   sectionTitle: { fontSize: 18, fontWeight: '700', marginBottom: 12, color: COLORS.textPrimary },
   field: { marginBottom: 12 },
   medicationCard: { 
-    backgroundColor: COLORS.gray50, 
+    backgroundColor: COLORS.white,
     borderRadius: 8, 
     padding: 12, 
     marginBottom: 12, 
@@ -992,6 +952,16 @@ const styles = StyleSheet.create({
   },
   receiptCheckboxTick: { fontSize: 14, fontWeight: '800', color: COLORS.primary },
   receiptUnavailableText: { fontSize: 13, fontWeight: '600', color: COLORS.textSecondary },
+  dropdownItem: {
+    borderWidth: 1,
+    borderColor: COLORS.gray200,
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    marginBottom: 8,
+    backgroundColor: COLORS.white,
+  },
+  dropdownItemText: { fontSize: 14, color: COLORS.textPrimary, fontWeight: '600' },
   
   noMedsText: { fontSize: 13, color: COLORS.textTertiary, textAlign: 'center', paddingVertical: 16 },
   
@@ -1000,8 +970,9 @@ const styles = StyleSheet.create({
     paddingVertical: 12, 
     borderTopWidth: 1, 
     borderTopColor: COLORS.gray200, 
-    backgroundColor: COLORS.white 
+    backgroundColor: COLORS.white,
+    alignItems: 'center',
   },
-  submitButton: { backgroundColor: COLORS.primary, paddingVertical: 13, borderRadius: 6, alignItems: 'center' },
+  submitButton: { backgroundColor: COLORS.primary, paddingVertical: 13, borderRadius: 6, alignItems: 'center', width: '100%', maxWidth: 420 },
   submitButtonText: { color: COLORS.white, fontWeight: '700', fontSize: 15 },
 });

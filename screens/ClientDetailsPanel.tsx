@@ -1,18 +1,21 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, Modal, TextInput, Alert, Image, ScrollView } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
 import JSZip from 'jszip';
-import { Client, Medication, loadData, updateMedication, addAdministrationRecord, updateClient, deleteClient } from '../src/storage';
+import { Client, Medication, loadData, saveData, updateMedication, addAdministrationRecord, updateClient, deleteClient } from '../src/storage';
 import { AddMedicationModal } from './AddMedicationScreen';
 import { AdminRecordModal } from '../src/components/AdminRecordModal';
 import { TimelineList } from '../src/components/TimelineList';
 import { HistoryList } from '../src/components/HistoryList';
 import { DeleteConfirmModal } from '../src/components/DeleteConfirmModal';
-import { getSlotNameFromTime, getAdministrationStatus } from '../src/utils/medicationTimingHelpers';
+import { getSlotNameFromTime, getAdministrationStatus, getAdministrationTimingStatus } from '../src/utils/medicationTimingHelpers';
 import { formatIsoDate, toIsoDate } from '../src/dateTimeUtils';
 import { safeParseInt } from '../src/validation';
 import { logError, showError, showSuccess } from '../src/errorHandling';
+
+const MED_UNITS = ['mg', 'g', 'mcg', 'ml', 'L', 'IU', 'mmol', '%', 'units'];
+const SCRIPT_LOCATIONS = ['Pharmacy file', 'Home office', 'Clients possession', 'Management office', 'Other'] as const;
 
 type Props = {
   client: Client | null;
@@ -21,7 +24,43 @@ type Props = {
   onClientUpdated?: () => void;
 };
 
+type TimelineSelectableItem = {
+  medId: string;
+  medName: string;
+  time: string;
+  totalDose?: string;
+  med: Medication;
+};
+
 export default function ClientDetailsPanel({ client, locationId, navigation, onClientUpdated }: Props) {
+
+  const isCleanNumberInput = (value: string): boolean => /^\d+(\.\d+)?$/.test(String(value || '').trim());
+
+  const formatDoseWithUnit = (dose?: string, unit?: string) => {
+    if (!dose) return '';
+    const trimmedDose = String(dose).trim();
+    const trimmedUnit = String(unit || '').trim();
+    if (!trimmedUnit) return trimmedDose;
+    if (trimmedDose.toLowerCase().includes(trimmedUnit.toLowerCase())) return trimmedDose;
+    return `${trimmedDose} ${trimmedUnit}`;
+  };
+
+  const formatCustomTimeRange = (time: string): string => {
+    const parts = time.split(':');
+    if (parts.length !== 2) return time;
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    if (Number.isNaN(h) || Number.isNaN(m)) return time;
+    const total = h * 60 + m;
+    const start = Math.max(0, total - 15);
+    const end = Math.min(1439, total + 15);
+    const fmt = (mins: number) => {
+      const hh = Math.floor(mins / 60);
+      const mm = mins % 60;
+      return `${hh.toString().padStart(2, '0')}:${mm.toString().padStart(2, '0')}`;
+    };
+    return `${fmt(start)}-${fmt(end)}`;
+  };
 
   const [tab, setTab] = useState<'medications' | 'timeline' | 'history'>('timeline');
   const [localClient, setLocalClient] = useState<Client | null>(client);
@@ -38,23 +77,38 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
   const [editPickerDay, setEditPickerDay] = useState(new Date().getDate());
   
   // Edit medication extended fields
-  const [editFrequencyType, setEditFrequencyType] = useState<'daily' | 'every-second-day' | 'weekly' | 'fortnightly'>('daily');
+  const [editFrequencyType, setEditFrequencyType] = useState<'daily' | 'every-second-day' | 'weekly' | 'fortnightly' | 'monthly'>('daily');
   const [editCustomTimes, setEditCustomTimes] = useState<string[]>([]);
+  const [editNewCustomTime, setEditNewCustomTime] = useState('');
   const [editMinTimeBetweenDoses, setEditMinTimeBetweenDoses] = useState('');
   const [editMaxDosePerAdministration, setEditMaxDosePerAdministration] = useState('');
   const [editMaxDosePer24Hours, setEditMaxDosePer24Hours] = useState('');
   const [editTabletsToBeGiven, setEditTabletsToBeGiven] = useState('');
   const [editMultipleDosesPerTablet, setEditMultipleDosesPerTablet] = useState(false);
   const [editDosePerTablet2, setEditDosePerTablet2] = useState('');
+  const [showEditSecondUnitDropdown, setShowEditSecondUnitDropdown] = useState(false);
+  const [showEditFrequencyDropdown, setShowEditFrequencyDropdown] = useState(false);
+  const [showEditSlotsDropdown, setShowEditSlotsDropdown] = useState(false);
+  const [editCourseType, setEditCourseType] = useState<'long-term' | 'short-term'>('long-term');
+  const [editStartTime, setEditStartTime] = useState('');
+  const [editHasScriptRepeats, setEditHasScriptRepeats] = useState(false);
+  const [editScriptRepeatsCount, setEditScriptRepeatsCount] = useState('');
+  const [editPrescriptionFileUri, setEditPrescriptionFileUri] = useState('');
+  const [editScriptLocation, setEditScriptLocation] = useState<(typeof SCRIPT_LOCATIONS)[number] | ''>('');
+  const [editScriptLocationOtherDetail, setEditScriptLocationOtherDetail] = useState('');
+  const [showEditScriptLocationDropdown, setShowEditScriptLocationDropdown] = useState(false);
   
   const [editingClient, setEditingClient] = useState(false);
-  const [clientDraft, setClientDraft] = useState<{ name: string; dob?: string; allergies?: string; gender?: string; weight?: string; contactEmail?: string; gp?: string; gpClinic?: string; medicareNumber?: string; photoUri?: string }>({ name: client?.name || '', dob: client?.dob || '', allergies: client?.allergies || '', gender: client?.gender || '', weight: client?.weight || '', contactEmail: client?.contactEmail || '', gp: client?.gp || '', gpClinic: client?.gpClinic || '', medicareNumber: client?.medicareNumber || '', photoUri: client?.photoUri || '' });
+  const [showEditClientLocationDropdown, setShowEditClientLocationDropdown] = useState(false);
+  const [editClientLocationId, setEditClientLocationId] = useState('');
+  const [availableClientLocations, setAvailableClientLocations] = useState<{ id: string; name: string }[]>([]);
+  const [clientDraft, setClientDraft] = useState<{ name: string; dob?: string; allergies?: string; additionalInfo?: string; gender?: string; weight?: string; contactEmail?: string; gp?: string; gpClinic?: string; medicareNumber?: string; photoUri?: string }>({ name: client?.name || '', dob: client?.dob || '', allergies: client?.allergies || '', additionalInfo: client?.additionalInfo || '', gender: client?.gender || '', weight: client?.weight || '', contactEmail: client?.contactEmail || '', gp: client?.gp || '', gpClinic: client?.gpClinic || '', medicareNumber: client?.medicareNumber || '', photoUri: client?.photoUri || '' });
   
   // Administration recording modal state
   const [recordingAdmin, setRecordingAdmin] = useState(false);
-  const [adminRecord, setAdminRecord] = useState<{ medId: string; time: string; medName: string } | null>(null);
+  const [adminRecord, setAdminRecord] = useState<{ medId: string; time: string; medName: string; presetDoseSummary?: string; dueDisplay?: string } | null>(null);
+  const [adminRecordsBatch, setAdminRecordsBatch] = useState<{ medId: string; time: string; medName: string; presetDoseSummary?: string; dueDisplay?: string }[]>([]);
   const [adminStatus, setAdminStatus] = useState<'given' | 'not-given' | 'third-party' | null>(null);
-  const [givenTime, setGivenTime] = useState('');
   const [notGivenReason, setNotGivenReason] = useState<'refused' | 'out-of-stock' | 'missed' | 'schedule-conflict' | 'other' | ''>('');
   const [otherReason, setOtherReason] = useState('');
   const [administeredBy, setAdministeredBy] = useState('');
@@ -62,12 +116,15 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
   // New administration recording fields
   const [adminScheduledTime, setAdminScheduledTime] = useState('');
   const [adminActualTime, setAdminActualTime] = useState('');
+  const [adminActualTimesByKey, setAdminActualTimesByKey] = useState<Record<string, string>>({});
+  const [adminEntrySource, setAdminEntrySource] = useState<'timeline' | 'medications' | null>(null);
+  const [adminSaveBlockReason, setAdminSaveBlockReason] = useState('');
   const [adminTabletsGiven, setAdminTabletsGiven] = useState('');
+  const [adminThirdPartyStockHandling, setAdminThirdPartyStockHandling] = useState<'already-transferred' | 'own-stock' | null>('already-transferred');
   const [adminNotes, setAdminNotes] = useState('');
 
-  // PRN warning modal state
-  const [showPrnWarning, setShowPrnWarning] = useState(false);
-  const [prnWarningMessage, setPrnWarningMessage] = useState('');
+  const [selectedTimelineItems, setSelectedTimelineItems] = useState<TimelineSelectableItem[]>([]);
+  const [selectedTimelineClientId, setSelectedTimelineClientId] = useState<string | null>(null);
 
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [medToDelete, setMedToDelete] = useState<{ id: string; name: string } | null>(null);
@@ -85,9 +142,72 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
   
   // Add medication modal state
   const [showAddMedication, setShowAddMedication] = useState(false);
+  const [showAddMedicationPrompt, setShowAddMedicationPrompt] = useState(false);
+  const [showSummaryOptions, setShowSummaryOptions] = useState(false);
+  const [showOutOfStockReviewPrompt, setShowOutOfStockReviewPrompt] = useState(false);
+  const [outOfStockReviewMessage, setOutOfStockReviewMessage] = useState('');
+  const [pendingOutOfStockBypassPrn, setPendingOutOfStockBypassPrn] = useState<boolean | undefined>(undefined);
   
   // History search state
   const [historySearchQuery, setHistorySearchQuery] = useState('');
+  const [showHistoryFilters, setShowHistoryFilters] = useState(false);
+  const [historyDatePreset, setHistoryDatePreset] = useState<'all' | 'today' | 'last7' | 'last30'>('all');
+  const [historySelectedStatuses, setHistorySelectedStatuses] = useState<string[]>([]);
+  const [historySelectedMeds, setHistorySelectedMeds] = useState<string[]>([]);
+  const [historyTimingFilter, setHistoryTimingFilter] = useState<'all' | 'on-time' | 'early' | 'late'>('all');
+  const [historyHasReasonOnly, setHistoryHasReasonOnly] = useState(false);
+  const [historyIncludeStockAdjustments, setHistoryIncludeStockAdjustments] = useState(true);
+  const [historyOnlyStockAdjustments, setHistoryOnlyStockAdjustments] = useState(false);
+
+  const allHistoryRecords = useMemo(() => {
+    if (!localClient) return [] as { medName: string; time: string; status: string; actualTime?: string; reason?: string; tabletsGiven?: number }[];
+
+    const allRecords = Array.from(localClient.medications || [])
+      .flatMap(m => (m.administrationRecords || []).map(r => ({ medName: m.name, ...r })));
+    const archivedRecords = Array.from(localClient.archivedMedicationHistory || []).flatMap(archived =>
+      (archived.records || []).map(r => ({ medName: archived.medName, time: r.time, status: r.status as any, actualTime: r.actualTime, reason: r.reason, tabletsGiven: r.tabletsGiven }))
+    );
+
+    return allRecords.concat(archivedRecords as any);
+  }, [localClient]);
+  const historyStatusOptions = useMemo(() => {
+    return Array.from(new Set(allHistoryRecords.map(r => r.status))).sort();
+  }, [allHistoryRecords]);
+
+  const historyMedicationOptions = useMemo(() => {
+    return Array.from(new Set(allHistoryRecords.map(r => r.medName))).sort((a, b) => a.localeCompare(b));
+  }, [allHistoryRecords]);
+
+  const activeHistoryFilterCount =
+    (historyDatePreset !== 'all' ? 1 : 0) +
+    (historySelectedStatuses.length > 0 ? 1 : 0) +
+    (historySelectedMeds.length > 0 ? 1 : 0) +
+    (historyTimingFilter !== 'all' ? 1 : 0) +
+    (historyHasReasonOnly ? 1 : 0) +
+    (!historyIncludeStockAdjustments ? 1 : 0) +
+    (historyOnlyStockAdjustments ? 1 : 0);
+
+  function toggleHistoryStatus(status: string) {
+    setHistorySelectedStatuses(prev =>
+      prev.includes(status) ? prev.filter(s => s !== status) : [...prev, status]
+    );
+  }
+
+  function toggleHistoryMedication(medName: string) {
+    setHistorySelectedMeds(prev =>
+      prev.includes(medName) ? prev.filter(m => m !== medName) : [...prev, medName]
+    );
+  }
+
+  function clearAllHistoryFilters() {
+    setHistoryDatePreset('all');
+    setHistorySelectedStatuses([]);
+    setHistorySelectedMeds([]);
+    setHistoryTimingFilter('all');
+    setHistoryHasReasonOnly(false);
+    setHistoryIncludeStockAdjustments(true);
+    setHistoryOnlyStockAdjustments(false);
+  }
 
   // Refresh local client state when selection changes
   useEffect(() => {
@@ -96,6 +216,7 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
       name: client?.name || '',
       dob: client?.dob || '',
       allergies: client?.allergies || '',
+      additionalInfo: client?.additionalInfo || '',
       gender: client?.gender || '',
       weight: client?.weight || '',
       contactEmail: client?.contactEmail || '',
@@ -104,10 +225,36 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
       medicareNumber: client?.medicareNumber || '',
       photoUri: client?.photoUri || ''
     });
+    setEditClientLocationId(locationId || '');
     setTab('timeline');
     setEditing(false);
     setEditingClient(false);
+    setSelectedTimelineItems([]);
+    setSelectedTimelineClientId(client?.id || null);
+    setAdminRecordsBatch([]);
+    setAdminActualTimesByKey({});
+    setAdminEntrySource(null);
+    setAdminSaveBlockReason('');
   }, [client?.id]);
+
+  useEffect(() => {
+    if (!editingClient) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const data = await loadData();
+        if (cancelled) return;
+        setAvailableClientLocations(data.map(loc => ({ id: loc.id, name: loc.name })));
+      } catch (e) {
+        logError(e, 'Load Locations For Client Edit');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [editingClient]);
 
   // Refresh data when screen comes into focus (e.g., after returning from StockManagement)
   useFocusEffect(
@@ -141,12 +288,35 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
     }
   }
 
-  const canSaveAdmin =
-    !!adminStatus &&
-    !(
-      (adminStatus === 'given' && (!adminTabletsGiven || !adminActualTime)) ||
-      (adminStatus === 'not-given' && notGivenReason === '')
-    );
+  const activeAdminMedication = localClient?.medications?.find(m => m.id === (adminRecordsBatch[0]?.medId || adminRecord?.medId));
+  const parseDateTimeFlexibleMs = (value?: string): number | undefined => {
+    if (!value) return undefined;
+    const raw = String(value).trim();
+    if (!raw) return undefined;
+
+    const direct = new Date(raw).getTime();
+    if (!Number.isNaN(direct)) return direct;
+
+    // Fallback for locale-like strings, e.g. 12/03/2026, 09:45:00 PM
+    const localMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}),?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+    if (localMatch) {
+      const day = Number.parseInt(localMatch[1], 10);
+      const month = Number.parseInt(localMatch[2], 10);
+      const year = Number.parseInt(localMatch[3], 10);
+      let hour = Number.parseInt(localMatch[4], 10);
+      const minute = Number.parseInt(localMatch[5], 10);
+      const second = localMatch[6] ? Number.parseInt(localMatch[6], 10) : 0;
+      const ampm = (localMatch[7] || '').toUpperCase();
+
+      if (ampm === 'PM' && hour < 12) hour += 12;
+      if (ampm === 'AM' && hour === 12) hour = 0;
+
+      const fallback = new Date(year, month - 1, day, hour, minute, second).getTime();
+      if (!Number.isNaN(fallback)) return fallback;
+    }
+
+    return undefined;
+  };
 
   function openEditStartDatePicker() {
     if (editStartDate) {
@@ -233,40 +403,96 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
     
     setSlots(s);
     setEditCustomTimes(customTimesArray);
+    setEditNewCustomTime('');
     setEditPrn(!!med.prn);
     setEditFrequencyType(med.frequencyType || 'daily');
-    setEditTabletsToBeGiven(((med.totalDose && med.dosePerTablet) ? (parseFloat(med.totalDose) / parseFloat(med.dosePerTablet)).toString() : '') || '');
+    const parsedTotalDose = Number.parseFloat(String(med.totalDose || '').trim());
+    const parsedDosePerTablet = Number.parseFloat(String(med.dosePerTablet || '').trim());
+    const hasNumericQuantity = Number.isFinite(parsedTotalDose) && Number.isFinite(parsedDosePerTablet) && parsedDosePerTablet > 0;
+    const derivedQuantity = hasNumericQuantity ? (parsedTotalDose / parsedDosePerTablet).toString() : '';
+    setEditTabletsToBeGiven(med.variableDoseInstructions || derivedQuantity || '');
     setEditMultipleDosesPerTablet(!!med.multipleDosesPerTablet);
     setEditDosePerTablet2(med.dosePerTablet2 || '');
+    setEditMed(current => current ? { ...current, dosePerTablet2Unit: current.dosePerTablet2Unit || current.unit || 'mg' } : current);
     setEditMinTimeBetweenDoses(med.prnVariableMinHoursBetween?.toString() || '');
     setEditMaxDosePerAdministration(med.prnVariableMaxDosePerAdministration?.toString() || '');
     setEditMaxDosePer24Hours(med.prnVariableMaxDosePer24Hours?.toString() || '');
+    setEditCourseType(med.courseType || 'long-term');
+    setEditStartTime(med.startTime ? (med.startTime.split('T')[1]?.slice(0, 5) || '') : '');
+    setEditHasScriptRepeats(!!med.hasScriptRepeats);
+    setEditScriptRepeatsCount(med.scriptRepeatsCount?.toString() || '');
+    setEditPrescriptionFileUri(med.prescriptionFileUri || '');
+    setEditScriptLocation(med.scriptLocation || '');
+    setEditScriptLocationOtherDetail(med.scriptLocationOtherDetail || '');
     setEditing(true);
   }
 
+  async function pickEditPrescriptionFile() {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        quality: 0.8,
+        base64: true,
+      });
+      if (!result.canceled && result.assets && result.assets[0]?.base64) {
+        const base64Uri = `data:image/jpeg;base64,${result.assets[0].base64}`;
+        setEditPrescriptionFileUri(base64Uri);
+      }
+    } catch (e) {
+      Alert.alert('Error', 'Failed to select prescription file');
+    }
+  }
+
   async function saveEdit() {
-    if (!editMed || !locationId || !localClient) return;
+    if (!editMed || !locationId || !localClient) {
+      Alert.alert('Cannot Save', 'Medication details are incomplete or unavailable. Please close and reopen the edit form, then try again.');
+      return;
+    }
     
-    // Calculate total dose from tablets to be given and dose per tablet
-    if (editTabletsToBeGiven && editMed.dosePerTablet) {
-      editMed.totalDose = (parseFloat(editTabletsToBeGiven) * parseFloat(editMed.dosePerTablet)).toString();
+    // Preserve free-text dose instructions and only calculate totalDose from clean numeric inputs.
+    const hasCleanQuantity = isCleanNumberInput(editTabletsToBeGiven);
+    const hasCleanPerItemDose = isCleanNumberInput(editMed.dosePerTablet || '');
+    if (editTabletsToBeGiven && hasCleanQuantity && hasCleanPerItemDose) {
+      editMed.totalDose = (parseFloat(editTabletsToBeGiven) * parseFloat(editMed.dosePerTablet || '')).toString();
+      editMed.variableDoseInstructions = undefined;
+    } else if (editTabletsToBeGiven && !hasCleanQuantity) {
+      editMed.totalDose = '';
+      editMed.variableDoseInstructions = editTabletsToBeGiven.trim();
+    } else {
+      editMed.variableDoseInstructions = undefined;
+      if (!editTabletsToBeGiven) {
+        editMed.totalDose = '';
+      }
     }
     
     // update scheduledTimes from slots and custom times
     editMed.scheduledTimes = editFrequencyType === 'daily' && !editPrn ? makeScheduledTimesFromSlots(slots, editCustomTimes) : [];
     editMed.prn = !!editPrn;
     editMed.frequencyType = editFrequencyType !== 'daily' ? editFrequencyType : undefined;
-    editMed.startTime = toIsoDate(editStartDate);
-    editMed.endTime = toIsoDate(editEndDate);
+    editMed.courseType = editPrn ? undefined : editCourseType;
+    editMed.startTime = editStartDate
+      ? `${editStartDate}T${(editStartTime || '00:00')}:00`
+      : undefined;
+    editMed.endTime = (editCourseType === 'short-term' && editEndDate) ? toIsoDate(editEndDate) : undefined;
+    editMed.hasScriptRepeats = editHasScriptRepeats || undefined;
+    editMed.scriptRepeatsCount = editHasScriptRepeats && editScriptRepeatsCount ? parseInt(editScriptRepeatsCount, 10) : undefined;
+    editMed.prescriptionFileUri = editHasScriptRepeats ? (editPrescriptionFileUri || undefined) : undefined;
+    editMed.scriptLocation = editHasScriptRepeats ? (editScriptLocation || undefined) : undefined;
+    editMed.scriptLocationOtherDetail = editHasScriptRepeats && editScriptLocation === 'Other'
+      ? (editScriptLocationOtherDetail || undefined)
+      : undefined;
     
     // Handle subcutaneous injection
     if (editMed.route === 'Subcutaneous injection') {
       editMed.dosePerTablet = undefined;
       editMed.dosePerTablet2 = undefined;
+      editMed.dosePerTablet2Unit = undefined;
       editMed.multipleDosesPerTablet = undefined;
     } else {
       editMed.multipleDosesPerTablet = editMultipleDosesPerTablet || undefined;
       editMed.dosePerTablet2 = editMultipleDosesPerTablet ? editDosePerTablet2 : undefined;
+      editMed.dosePerTablet2Unit = editMultipleDosesPerTablet ? (editMed.dosePerTablet2Unit || editMed.unit) : undefined;
     }
     
     // Save PRN variable restrictions
@@ -296,8 +522,10 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
     
     // Check if medication has remaining stock
     const stockCount = safeParseInt(editMed.stock || 0);
+    const route = String(editMed.route || '').toLowerCase();
+    const bypassStockZeroDeleteRule = route.includes('liquid') || route.includes('eye drops');
     
-    if (stockCount > 0) {
+    if (stockCount > 0 && !bypassStockZeroDeleteRule) {
       // Show in-app warning modal
       setStockWarningMed({ name: editMed.name, stock: stockCount });
       setShowStockWarning(true);
@@ -392,39 +620,50 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
 
   // Filter history records by search query
   function getFilteredHistoryRecords() {
-    if (!localClient || !historySearchQuery.trim()) {
-      const allRecords = Array.from(localClient?.medications || [])
-        .flatMap(m => (m.administrationRecords || []).map(r => ({ medName: m.name, ...r })));
-      const archivedRecords = Array.from(localClient?.archivedMedicationHistory || []).flatMap(archived =>
-        (archived.records || []).map(r => ({ medName: archived.medName, time: r.time, status: r.status as any, actualTime: r.actualTime, reason: r.reason }))
-      );
-      return allRecords.concat(archivedRecords as any);
-    }
-    
-    const query = historySearchQuery.toLowerCase();
-    const allRecords = Array.from(localClient?.medications || [])
-      .flatMap(m => (m.administrationRecords || []).map(r => ({ medName: m.name, ...r })));
-    const archivedRecords = Array.from(localClient?.archivedMedicationHistory || []).flatMap(archived =>
-      (archived.records || []).map(r => ({ medName: archived.medName, time: r.time, status: r.status as any, actualTime: r.actualTime, reason: r.reason }))
-    );
-    
-    return allRecords.concat(archivedRecords as any)
-      .filter(record => 
-        record.medName.toLowerCase().includes(query) ||
-        record.status.toLowerCase().includes(query) ||
-        (record.reason && record.reason.toLowerCase().includes(query))
-      );
-  }
+    const query = historySearchQuery.trim().toLowerCase();
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const sevenDaysAgo = now.getTime() - (7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = now.getTime() - (30 * 24 * 60 * 60 * 1000);
 
-  async function markAdministration(medId: string, timeIso: string, status: 'given' | 'missed') {
-    if (!locationId || !localClient) return;
-    try {
-      await addAdministrationRecord(locationId, localClient.id, medId, timeIso, status);
-      await refreshLocal();
-    } catch (e) {
-      logError(e, 'Mark Administration');
-      showError(e, 'Failed to record administration');
-    }
+    return allHistoryRecords.filter(record => {
+      if (query) {
+        const matchesSearch =
+          record.medName.toLowerCase().includes(query) ||
+          record.status.toLowerCase().includes(query) ||
+          (record.reason && record.reason.toLowerCase().includes(query));
+        if (!matchesSearch) return false;
+      }
+
+      const eventTime = new Date(record.actualTime || record.time).getTime();
+      if (!Number.isFinite(eventTime)) return false;
+
+      if (historyDatePreset === 'today' && eventTime < startOfToday) return false;
+      if (historyDatePreset === 'last7' && eventTime < sevenDaysAgo) return false;
+      if (historyDatePreset === 'last30' && eventTime < thirtyDaysAgo) return false;
+
+      if (historyOnlyStockAdjustments) {
+        const isStockRelated = record.status === 'stock-adjustment' || record.status === 'created';
+        if (!isStockRelated) return false;
+      }
+
+      if (!historyIncludeStockAdjustments && record.status === 'stock-adjustment') return false;
+
+      if (historySelectedStatuses.length > 0 && !historySelectedStatuses.includes(record.status)) return false;
+      if (historySelectedMeds.length > 0 && !historySelectedMeds.includes(record.medName)) return false;
+
+      if (historyHasReasonOnly && !(record.reason && record.reason.trim())) return false;
+
+      if (historyTimingFilter !== 'all') {
+        if (record.status !== 'given' || !record.actualTime) return false;
+        const timing = getAdministrationTimingStatus(record.time, record.actualTime);
+        if (historyTimingFilter === 'on-time' && timing !== 'given-on-time') return false;
+        if (historyTimingFilter === 'early' && timing !== 'given-early') return false;
+        if (historyTimingFilter === 'late' && timing !== 'given-late') return false;
+      }
+
+      return true;
+    });
   }
 
   async function pickClientPhoto() {
@@ -446,12 +685,24 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
   }
 
   async function saveClientEdit() {
-    if (!locationId || !localClient) return;
+    if (!locationId || !localClient) {
+      Alert.alert('Cannot Save', 'Client details are unavailable right now. Please refresh the screen and try again.');
+      return;
+    }
+    if (!clientDraft.name.trim()) {
+      Alert.alert('Validation', 'Please enter client name');
+      return;
+    }
+    if (!editClientLocationId) {
+      Alert.alert('Validation', 'Please select a location');
+      return;
+    }
     const updated: Client = { 
       ...localClient, 
-      name: clientDraft.name, 
+      name: clientDraft.name,
       dob: clientDraft.dob, 
       allergies: clientDraft.allergies,
+      additionalInfo: clientDraft.additionalInfo?.trim() || undefined,
       gender: clientDraft.gender as any,
       weight: clientDraft.weight,
       contactEmail: clientDraft.contactEmail,
@@ -461,7 +712,27 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
       photoUri: clientDraft.photoUri || undefined,
     };
     try {
-      await updateClient(locationId, updated);
+      if (editClientLocationId === locationId) {
+        await updateClient(locationId, updated);
+      } else {
+        const data = await loadData();
+        const sourceLoc = data.find(l => l.id === locationId);
+        const targetLoc = data.find(l => l.id === editClientLocationId);
+        if (!sourceLoc || !targetLoc) {
+          Alert.alert('Cannot Save', 'Selected location was not found. Please refresh and try again.');
+          return;
+        }
+
+        const sourceIdx = sourceLoc.clients.findIndex(c => c.id === localClient.id);
+        if (sourceIdx === -1) {
+          Alert.alert('Cannot Save', 'Client could not be found in the current location. Please refresh and try again.');
+          return;
+        }
+
+        sourceLoc.clients.splice(sourceIdx, 1);
+        targetLoc.clients.push(updated);
+        await saveData(data);
+      }
       setEditingClient(false);
       await refreshLocal();
     } catch (e) {
@@ -477,25 +748,82 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
     }
 
     try {
-      const record = (localClient.medications || [])
-        .flatMap(m => (m.administrationRecords || []).map(r => ({ ...r, medId: m.id })))
-        .find(r => r.medId === errorCorrectionRecord.medId && r.time === errorCorrectionRecord.time);
+      const med = localClient.medications?.find(m => m.id === errorCorrectionRecord.medId);
 
-      if (record) {
-        // Delete the incorrect "given" record
-        const med = localClient.medications?.find(m => m.id === errorCorrectionRecord.medId);
-        if (med) {
-          const updatedRecords = (med.administrationRecords || []).filter(r => r.time !== errorCorrectionRecord.time);
-          const updatedMed = { ...med, administrationRecords: updatedRecords };
-          await updateMedication(locationId, localClient.id, updatedMed);
+      if (med) {
+        const givenRecordsAtTime = (med.administrationRecords || []).filter(
+          r => r.time === errorCorrectionRecord.time && r.status === 'given'
+        );
+        const givenRecordToReverse = givenRecordsAtTime.length > 0
+          ? givenRecordsAtTime[givenRecordsAtTime.length - 1]
+          : undefined;
+
+        const inferAdministrationQuantity = (medication?: Medication): number | undefined => {
+          if (!medication) return undefined;
+          const totalDose = parseFloat(String(medication.totalDose || ''));
+          const dosePerTablet = parseFloat(String(medication.dosePerTablet || ''));
+          if (Number.isFinite(totalDose) && Number.isFinite(dosePerTablet) && dosePerTablet > 0) {
+            return totalDose / dosePerTablet;
+          }
+          return 1;
+        };
+
+        if (!givenRecordToReverse) {
+          Alert.alert('Unable to Mark as Error', 'No given administration record was found to reverse for this scheduled time.');
+          return;
         }
+
+        const quantityToRestore =
+          (typeof givenRecordToReverse.tabletsGiven === 'number' && Number.isFinite(givenRecordToReverse.tabletsGiven) && givenRecordToReverse.tabletsGiven > 0)
+            ? givenRecordToReverse.tabletsGiven
+            : inferAdministrationQuantity(med);
+
+        const allRecords = med.administrationRecords || [];
+        let removeIndex = -1;
+        for (let i = allRecords.length - 1; i >= 0; i -= 1) {
+          const r = allRecords[i];
+          if (r.time === errorCorrectionRecord.time && r.status === 'given') {
+            removeIndex = i;
+            break;
+          }
+        }
+        const updatedRecords = removeIndex >= 0
+          ? allRecords.filter((_, idx) => idx !== removeIndex)
+          : allRecords;
+
+        const shouldRestoreStock =
+          !!givenRecordToReverse &&
+          typeof med.stock === 'number' &&
+          med.stock > 0 &&
+          typeof quantityToRestore === 'number' &&
+          Number.isFinite(quantityToRestore) &&
+          quantityToRestore > 0;
+
+        const updatedMed: Medication = {
+          ...med,
+          administrationRecords: updatedRecords,
+          stock: shouldRestoreStock ? (med.stock || 0) + quantityToRestore : med.stock,
+        };
+
+        await updateMedication(locationId, localClient.id, updatedMed);
       }
 
-      // Log the error correction
-      const originalScheduledTime = new Date(errorCorrectionRecord.time).toLocaleString();
-      const correctionTime = new Date().toLocaleString();
-      const errorLog = `Error correction: ${errorReason}${errorNotes ? ` - ${errorNotes}` : ''} | Marked as error: ${correctionTime} | Originally scheduled: ${originalScheduledTime}`;
-      await addAdministrationRecord(locationId, localClient.id, errorCorrectionRecord.medId, errorCorrectionRecord.time, 'missed', undefined, errorLog);
+      // Log a compact audit-only entry without affecting timeline due/overdue status.
+      const errorReasonLabel =
+        errorReason === 'wrong-client' ? 'Wrong Client' :
+        errorReason === 'wrong-time' ? 'Wrong Time' :
+        errorReason === 'wrong-medication' ? 'Wrong Medication' :
+        'Other';
+      const correctionReason = `Marked as in error (${errorReasonLabel})${errorNotes ? ` - ${errorNotes}` : ''}`;
+      await addAdministrationRecord(
+        locationId,
+        localClient.id,
+        errorCorrectionRecord.medId,
+        errorCorrectionRecord.time,
+        'error-correction',
+        new Date().toISOString(),
+        correctionReason
+      );
 
       setShowErrorCorrection(false);
       setErrorCorrectionRecord(null);
@@ -509,184 +837,455 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
     }
   }
 
-  async function saveAdministrationRecord(bypassPrnLimit?: boolean) {
-    if (!adminRecord || !adminStatus || !locationId || !localClient) {
-      console.log('[SAVE_ADMIN] Early return - missing required data:', { adminRecord: !!adminRecord, adminStatus, locationId: !!locationId, localClient: !!localClient });
+  async function saveAdministrationRecord(bypassPrnLimit?: boolean, bypassOutOfStockPrompt?: boolean) {
+    setAdminSaveBlockReason('');
+    const recordsToSave = adminRecordsBatch.length > 0
+      ? adminRecordsBatch
+      : (adminRecord ? [adminRecord] : []);
+    const outOfStockRecordedMeds = new Set<string>();
+
+    const blockAdministrationSave = (title: string, message: string) => {
+      setAdminSaveBlockReason(message);
+      Alert.alert(title, message);
+    };
+
+    const getNumericStock = (med?: Medication): number | undefined => {
+      if (!med) return undefined;
+      const rawStock = (med as any).stock;
+      const numericStock = typeof rawStock === 'number' ? rawStock : parseFloat(String(rawStock));
+      return Number.isFinite(numericStock) ? numericStock : undefined;
+    };
+
+    if (recordsToSave.length === 0 || !adminStatus || !locationId || !localClient) {
+      blockAdministrationSave(
+        'Cannot Save',
+        recordsToSave.length === 0
+          ? 'No medication entries were selected to save.'
+          : !adminStatus
+            ? 'Please choose a status before saving (Given, Not Given, or Third Party).'
+            : 'Required client or location details are missing. Please close and reopen this form, then try again.'
+      );
       return;
     }
     
     try {
-      console.log('[SAVE_ADMIN] Starting save attempt. Status:', adminStatus, 'Tablets:', adminTabletsGiven, 'ActualTime:', adminActualTime);
-      
       if (adminStatus === 'given' || adminStatus === 'third-party') {
-        // Validate that tablets given is provided
-        if (!adminTabletsGiven) {
-          Alert.alert('Validation', 'Please enter the number of tablets/capsules given');
+        const showStockReviewWarnings = adminEntrySource === 'timeline';
+        const shouldApplyStockDeduction =
+          adminStatus === 'given' || (adminStatus === 'third-party' && adminThirdPartyStockHandling === 'own-stock');
+
+        const inferAdministrationQuantity = (med?: Medication): number | undefined => {
+          if (!med) return undefined;
+          const totalDose = parseFloat(String(med.totalDose || ''));
+          const dosePerTablet = parseFloat(String(med.dosePerTablet || ''));
+          if (Number.isFinite(totalDose) && Number.isFinite(dosePerTablet) && dosePerTablet > 0) {
+            return totalDose / dosePerTablet;
+          }
+          return 1;
+        };
+
+        const medicationRoute = (localClient?.medications?.find(m => m.id === recordsToSave[0]?.medId)?.route || '').toLowerCase();
+        const requiresTabletCount = medicationRoute.includes('tablet') || medicationRoute.includes('capsule');
+        const isMultiRecordMode = recordsToSave.length > 1;
+        const requireQuantityInput =
+          !isMultiRecordMode && (
+            adminStatus === 'given'
+              ? requiresTabletCount
+              : (adminStatus === 'third-party' && requiresTabletCount && adminThirdPartyStockHandling === 'own-stock')
+          );
+        const parsedTabletsGiven = parseFloat(adminTabletsGiven);
+        const enteredQuantity = Number.isFinite(parsedTabletsGiven) ? parsedTabletsGiven : undefined;
+        // Validate quantity only for tablet/capsule routes.
+        if (requireQuantityInput && !adminTabletsGiven) {
+          blockAdministrationSave('Validation', 'Please enter the number of tablets/capsules given');
           return;
         }
-        
-        // Validate that actual time is provided
-        if (!adminActualTime) {
-          Alert.alert('Validation', 'Please record the actual time the medication was given');
+        if (requireQuantityInput && !Number.isFinite(parsedTabletsGiven)) {
+          blockAdministrationSave('Validation', 'Please enter a valid number for tablets/capsules given');
           return;
         }
 
-        // Enforce PRN limits (max per day and minimum hours apart)
-        console.log('[SAVE_ADMIN] Loading fresh data for PRN check...');
-        const freshData = await loadData();
-        console.log('[SAVE_ADMIN] Fresh data loaded. Locations:', freshData.length);
-        
-        const freshLoc = freshData.find(l => l.id === locationId);
-        console.log('[SAVE_ADMIN] Fresh location found?', !!freshLoc);
-        
-        const freshClient = freshLoc?.clients.find(c => c.id === localClient.id);
-        console.log('[SAVE_ADMIN] Fresh client found?', !!freshClient, 'medications:', freshClient?.medications?.length);
-        
-        const prnMed = freshClient?.medications?.find(m => m.id === adminRecord.medId) || localClient.medications?.find(m => m.id === adminRecord.medId);
-        console.log('[SAVE_ADMIN] Med lookup - Fresh found?', !!freshClient?.medications?.find(m => m.id === adminRecord.medId), 'Fallback found?', !!localClient.medications?.find(m => m.id === adminRecord.medId));
-        
-        console.log('[SAVE_ADMIN] Med found:', prnMed?.name, 'PRN:', prnMed?.prn, 'bypassPrnLimit:', bypassPrnLimit);
-        console.log('[SAVE_ADMIN] Will run PRN check?', (prnMed?.prn && !bypassPrnLimit) ? 'YES' : 'NO - Condition failed');
-        
-        if (prnMed?.prn && !bypassPrnLimit) {
-          console.log('[PRN_CHECK] ✅ ENTERING PRN CHECK LOGIC');
-          const newTimeMs = new Date(adminActualTime || adminRecord.time).getTime();
-          const tabletsGivenNow = parseFloat(adminTabletsGiven);
-          
-          if (!isNaN(newTimeMs)) {
-            const givenRecords = (prnMed.administrationRecords || []).filter(r => r.status === 'given');
-            const recordTimes = givenRecords
-              .map(r => new Date(r.actualTime || r.time).getTime())
-              .filter(t => !isNaN(t));
+        if (adminStatus === 'third-party' && !administeredBy.trim()) {
+          blockAdministrationSave('Validation', 'Please enter who administered the medication');
+          return;
+        }
 
-            console.log(`[PRN_CHECK] Med: ${prnMed.name}, New time (ms): ${newTimeMs} (${new Date(newTimeMs).toISOString()})`);
-            console.log(`[PRN_CHECK] Existing doses (${recordTimes.length}):`, recordTimes.map(t => ({ ms: t, iso: new Date(t).toISOString() })));
+        if (adminStatus === 'third-party' && !adminThirdPartyStockHandling) {
+          blockAdministrationSave('Validation', 'Please select one stock handling option for third-party administration');
+          return;
+        }
 
-            // Variable PRN restrictions check (for medications with variable doses)
-            if (prnMed.prnVariableMinHoursBetween || prnMed.prnVariableMaxDosePerAdministration || prnMed.prnVariableMaxDosePer24Hours) {
-              console.log('[PRN_CHECK] Checking variable PRN restrictions...');
-              
-              // Check max dose per administration
-              if (prnMed.prnVariableMaxDosePerAdministration && tabletsGivenNow > prnMed.prnVariableMaxDosePerAdministration) {
-                const msg = `${prnMed.name} cannot exceed ${prnMed.prnVariableMaxDosePerAdministration} tablet${prnMed.prnVariableMaxDosePerAdministration === 1 ? '' : 's'} per administration. You entered ${tabletsGivenNow} tablet${tabletsGivenNow === 1 ? '' : 's'}.`;
-                console.log('[PRN_CHECK] ⚠️ MAX DOSE PER ADMIN VIOLATION!');
-                setPrnWarningMessage(msg);
-                setShowPrnWarning(true);
+        const requiresOutOfStockAcknowledgement =
+          adminStatus === 'given' || (adminStatus === 'third-party' && adminThirdPartyStockHandling === 'own-stock');
+
+        if (requiresOutOfStockAcknowledgement && !bypassOutOfStockPrompt) {
+          const freshData = await loadData();
+          const freshLoc = freshData.find(l => l.id === locationId);
+          const freshClient = freshLoc?.clients.find(c => c.id === localClient.id);
+          const outOfStockNow = new Set<string>();
+
+          for (const recordToSave of recordsToSave) {
+            const med = freshClient?.medications?.find(m => m.id === recordToSave.medId)
+              || localClient.medications?.find(m => m.id === recordToSave.medId);
+            const stock = getNumericStock(med);
+            if (typeof stock === 'number' && stock <= 0 && med?.name) {
+              outOfStockNow.add(med.name);
+            }
+          }
+
+          if (outOfStockNow.size > 0) {
+            const medNames = Array.from(outOfStockNow).join(', ');
+            setOutOfStockReviewMessage(
+              `This medication is out of stock in the system (${medNames}). Please review Stock Management and conduct a medication count.`
+            );
+            setPendingOutOfStockBypassPrn(bypassPrnLimit);
+            setShowOutOfStockReviewPrompt(true);
+            return;
+          }
+        }
+
+        // Validate actual time only for direct "given" entries (not third-party).
+        if (adminStatus === 'given') {
+          if (isMultiRecordMode) {
+            for (const rec of recordsToSave) {
+              const recordKey = `${rec.medId}::${rec.time}`;
+              const recordActualTime = adminActualTimesByKey[recordKey];
+              if (!recordActualTime) {
+                blockAdministrationSave('Validation', 'Please record the actual date/time for each selected medication.');
                 return;
               }
 
-              // Check minimum time between doses
-              if (prnMed.prnVariableMinHoursBetween && prnMed.prnVariableMinHoursBetween > 0 && recordTimes.length > 0) {
-                const lastTimeMs = Math.max(...recordTimes);
-                const timeSinceLastMs = newTimeMs - lastTimeMs;
-                const hoursSinceLast = timeSinceLastMs / (1000 * 60 * 60);
-                console.log(`[PRN_CHECK] Variable - Last dose: ${new Date(lastTimeMs).toISOString()}, hours since: ${hoursSinceLast.toFixed(1)}, min required: ${prnMed.prnVariableMinHoursBetween}`);
-                
-                if (hoursSinceLast < prnMed.prnVariableMinHoursBetween) {
-                  const msg = `${prnMed.name} doses must be at least ${prnMed.prnVariableMinHoursBetween} hour${prnMed.prnVariableMinHoursBetween === 1 ? '' : 's'} apart. The last dose was ${hoursSinceLast.toFixed(1)} hour${hoursSinceLast.toFixed(1) === '1.0' ? '' : 's'} ago.`;
-                  console.log('[PRN_CHECK] ⚠️ VARIABLE MIN-HOURS VIOLATION!');
-                  setPrnWarningMessage(msg);
-                  setShowPrnWarning(true);
-                  return;
+              const actualGivenMs = new Date(recordActualTime).getTime();
+              if (Number.isNaN(actualGivenMs)) {
+                blockAdministrationSave('Validation', 'One or more selected administration date/time values are invalid.');
+                return;
+              }
+              if (actualGivenMs > Date.now()) {
+                blockAdministrationSave('Cannot Record Future Administration', 'The given time cannot be in the future. Please select the current time or an earlier time.');
+                return;
+              }
+            }
+          } else {
+            if (!adminActualTime) {
+              blockAdministrationSave('Validation', 'Please record the actual time the medication was given');
+              return;
+            }
+
+            // Do not allow recording a given administration in the future.
+            const actualGivenMs = new Date(adminActualTime).getTime();
+            if (Number.isNaN(actualGivenMs)) {
+              blockAdministrationSave('Validation', 'The recorded administration date/time is invalid');
+              return;
+            }
+            if (actualGivenMs > Date.now()) {
+              blockAdministrationSave('Cannot Record Future Administration', 'The given time cannot be in the future. Please select the current time or an earlier time.');
+              return;
+            }
+          }
+        }
+
+        // Enforce PRN limits (max per day and minimum hours apart)
+        const warnedOutOfStock = new Set<string>();
+        const warnedLowStock = new Set<string>();
+        const showPrnLimitAlert = (message: string) => {
+          setAdminSaveBlockReason(message);
+          Alert.alert(
+            'PRN Dose Limit',
+            message,
+            [
+              { text: 'Cancel', style: 'cancel' },
+              {
+                text: 'Record Anyway',
+                onPress: () => {
+                  saveAdministrationRecord(true, bypassOutOfStockPrompt);
                 }
               }
+            ]
+          );
+        };
+        for (const recordToSave of recordsToSave) {
+          const recordKey = `${recordToSave.medId}::${recordToSave.time}`;
+          const actualTimeForRecord =
+            adminStatus === 'given'
+              ? (isMultiRecordMode ? adminActualTimesByKey[recordKey] : adminActualTime)
+              : undefined;
+          const freshData = await loadData();
 
-              // Check max tablets in 24 hours
-              if (prnMed.prnVariableMaxDosePer24Hours && prnMed.prnVariableMaxDosePer24Hours > 0) {
-                const twentyFourHoursAgo = newTimeMs - (24 * 60 * 60 * 1000);
-                const recentRecords = givenRecords.filter(r => {
-                  const recTime = new Date(r.actualTime || r.time).getTime();
-                  return !isNaN(recTime) && recTime >= twentyFourHoursAgo;
-                });
-                
-                // Sum up tablets given in last 24 hours (parsing from notes or using default calculation)
-                let tabletsInLast24Hours = 0;
-                for (const rec of recentRecords) {
-                  // Try to extract tablets from the record - this is a simplified approach
-                  // In a real scenario, you'd want to store tablets given in the record itself
-                  const recMed = prnMed;
-                  if (recMed.totalDose && recMed.dosePerTablet) {
-                    const calculated = parseFloat(recMed.totalDose) / parseFloat(recMed.dosePerTablet);
-                    if (!isNaN(calculated) && isFinite(calculated)) {
-                      tabletsInLast24Hours += calculated;
-                    }
-                  }
-                }
-                
-                const totalAfterThisDose = tabletsInLast24Hours + tabletsGivenNow;
-                console.log(`[PRN_CHECK] Variable - Tablets in last 24hrs: ${tabletsInLast24Hours}, this dose: ${tabletsGivenNow}, total would be: ${totalAfterThisDose}, limit: ${prnMed.prnVariableMaxDosePer24Hours}`);
-                
-                if (totalAfterThisDose > prnMed.prnVariableMaxDosePer24Hours) {
-                  const msg = `${prnMed.name} cannot exceed ${prnMed.prnVariableMaxDosePer24Hours} tablet${prnMed.prnVariableMaxDosePer24Hours === 1 ? '' : 's'} in 24 hours. Currently ${tabletsInLast24Hours} tablet${tabletsInLast24Hours === 1 ? '' : 's'} have been given in the last 24 hours. This dose would bring the total to ${totalAfterThisDose} tablet${totalAfterThisDose === 1 ? '' : 's'}.`;
-                  console.log('[PRN_CHECK] ⚠️ 24-HOUR LIMIT VIOLATION!');
-                  setPrnWarningMessage(msg);
-                  setShowPrnWarning(true);
-                  return;
+          const freshLoc = freshData.find(l => l.id === locationId);
+          const freshClient = freshLoc?.clients.find(c => c.id === localClient.id);
+          const prnMed = freshClient?.medications?.find(m => m.id === recordToSave.medId) || localClient.medications?.find(m => m.id === recordToSave.medId);
+          const stockAtRecordTime = getNumericStock(prnMed);
+          if (typeof stockAtRecordTime === 'number' && stockAtRecordTime <= 0 && prnMed?.name) {
+            outOfStockRecordedMeds.add(prnMed.name);
+          }
+          const quantityForThisRecord =
+            adminStatus === 'third-party'
+              ? (adminThirdPartyStockHandling === 'own-stock' ? enteredQuantity : undefined)
+              : (enteredQuantity ?? inferAdministrationQuantity(prnMed));
+
+          if (
+            prnMed &&
+            typeof enteredQuantity === 'number' &&
+            Number.isFinite(enteredQuantity) &&
+            enteredQuantity > 0
+          ) {
+            const outlinedTotalDose = parseFloat(String(prnMed.totalDose || ''));
+            const outlinedDosePerTablet = parseFloat(String(prnMed.dosePerTablet || ''));
+            if (
+              Number.isFinite(outlinedTotalDose) &&
+              Number.isFinite(outlinedDosePerTablet) &&
+              outlinedDosePerTablet > 0
+            ) {
+              const outlinedTablets = outlinedTotalDose / outlinedDosePerTablet;
+              const epsilon = 0.000001;
+              if (enteredQuantity > outlinedTablets + epsilon) {
+                blockAdministrationSave(
+                  'Dose Exceeds Prescribed Amount',
+                  `You entered ${enteredQuantity} tablets/capsules, but the outlined amount for this medication is ${outlinedTablets.toFixed(2).replace(/\.00$/, '')} per administration.`
+                );
+                return;
+              }
+            }
+          }
+
+          if (shouldApplyStockDeduction && showStockReviewWarnings) {
+            const stock = getNumericStock(prnMed);
+            if (typeof stock === 'number') {
+              if (stock <= 0 && prnMed && !warnedOutOfStock.has(prnMed.name)) {
+                warnedOutOfStock.add(prnMed.name);
+                Alert.alert(
+                  'Stock Review Notice',
+                  `${prnMed.name} is marked out of stock. Stock records may be incorrect and should be reviewed.`
+                );
+              } else if (
+                prnMed &&
+                !warnedLowStock.has(prnMed.name) &&
+                typeof quantityForThisRecord === 'number' &&
+                Number.isFinite(quantityForThisRecord) &&
+                quantityForThisRecord > 0
+              ) {
+                const parsedTotalDose = parseFloat(String(prnMed.totalDose || ''));
+                const parsedDosePerTablet = parseFloat(String(prnMed.dosePerTablet || ''));
+                const outlinedQuantity =
+                  Number.isFinite(parsedTotalDose) && Number.isFinite(parsedDosePerTablet) && parsedDosePerTablet > 0
+                    ? (parsedTotalDose / parsedDosePerTablet)
+                    : quantityForThisRecord;
+                const epsilon = 0.000001;
+                if (stock <= outlinedQuantity + epsilon) {
+                  warnedLowStock.add(prnMed.name);
+                  Alert.alert(
+                    'Stock Review Notice',
+                    `${prnMed.name} is low in stock. Only one outlined dose remains (${outlinedQuantity.toFixed(2).replace(/\.00$/, '')} units). Stock records should be reviewed.`
+                  );
                 }
               }
             }
-
-            console.log('[PRN_CHECK] ✅ All PRN checks passed');
-          } else {
-            console.log('[PRN_CHECK] ❌ Invalid newTimeMs:', newTimeMs);
           }
-        } else {
-          console.log('[PRN_CHECK] ❌ Skipping PRN check - PRN:', prnMed?.prn, 'bypassPrnLimit:', bypassPrnLimit);
-        }
-        
-        // Record against the scheduled time with the actual time taken
-        console.log('[SAVE_ADMIN] PRN checks passed. Recording administration...');
-        await addAdministrationRecord(locationId, localClient.id, adminRecord.medId, adminRecord.time, 'given', adminActualTime);
-        console.log('[SAVE_ADMIN] Administration recorded.');
-        
-        // Re-fetch fresh data from storage to get updated medication with new administration record
-        const data = await loadData();
-        const loc = data.find(l => l.id === locationId);
-        const client = loc?.clients.find(c => c.id === localClient.id);
-        const med = client?.medications?.find(m => m.id === adminRecord.medId);
-        
-        // Decrease stock if medication has stock tracking
-        if (med && med.stock !== undefined && med.stock > 0) {
-          const tabletsToDeduct = safeParseInt(adminTabletsGiven, 0);
-          if (tabletsToDeduct > 0) {
-            const updatedMed = { ...med, stock: Math.max(0, med.stock - tabletsToDeduct) };
-            await updateMedication(locationId, localClient.id, updatedMed);
+
+          if (prnMed?.prn && !bypassPrnLimit) {
+            const parsedNewTimeMs = parseDateTimeFlexibleMs(actualTimeForRecord || recordToSave.time);
+            const newTimeMs = typeof parsedNewTimeMs === 'number' ? parsedNewTimeMs : NaN;
+            const tabletsGivenNowRaw = quantityForThisRecord ?? parseFloat(adminTabletsGiven);
+
+            // Support both current and legacy PRN rule field names and string values.
+            const parseRuleNumber = (...candidates: any[]): number | undefined => {
+              for (const candidate of candidates) {
+                const parsed = Number.parseFloat(String(candidate ?? ''));
+                if (Number.isFinite(parsed) && parsed > 0) return parsed;
+              }
+              return undefined;
+            };
+
+            const minHoursBetweenFromKnown = parseRuleNumber(
+              prnMed.prnVariableMinHoursBetween,
+              (prnMed as any).minTimeBetweenDoses,
+              (prnMed as any).prnMinHoursBetween,
+              (prnMed as any).prnMinimumHoursBetween,
+              (prnMed as any).prnMinimumHoursBetweenDoses
+            );
+            let minHoursBetween = minHoursBetweenFromKnown;
+            if (!minHoursBetween && prnMed) {
+              const dynamicMinHourKeys = Object.keys(prnMed as any).filter(k => {
+                const key = k.toLowerCase();
+                return key.includes('prn') && key.includes('min') && key.includes('hour');
+              });
+              for (const key of dynamicMinHourKeys) {
+                const parsed = parseRuleNumber((prnMed as any)[key]);
+                if (parsed) {
+                  minHoursBetween = parsed;
+                  break;
+                }
+              }
+            }
+            const maxDosePerAdministration = parseRuleNumber(
+              prnMed.prnVariableMaxDosePerAdministration,
+              (prnMed as any).maxDosePerAdministration,
+              (prnMed as any).prnMaxDosePerAdministration
+            );
+            const maxDosePer24Hours = parseRuleNumber(
+              prnMed.prnVariableMaxDosePer24Hours,
+              (prnMed as any).prnVariableMaxDosesIn24h,
+              (prnMed as any).maxDosePer24Hours,
+              (prnMed as any).prnMaxDosePer24Hours
+            );
+            const tabletsGivenNow =
+              typeof tabletsGivenNowRaw === 'number' && Number.isFinite(tabletsGivenNowRaw) && tabletsGivenNowRaw > 0
+                ? tabletsGivenNowRaw
+                : (inferAdministrationQuantity(prnMed) || 0);
+
+            if (!isNaN(newTimeMs)) {
+              const givenRecords = (prnMed.administrationRecords || []).filter(r => r.status === 'given');
+              const recordTimes = givenRecords
+                .map(r => parseDateTimeFlexibleMs(r.actualTime || r.time))
+                .filter((t): t is number => typeof t === 'number' && !Number.isNaN(t));
+
+              if (minHoursBetween || maxDosePerAdministration || maxDosePer24Hours) {
+                if (maxDosePerAdministration && tabletsGivenNow > maxDosePerAdministration) {
+                  const msg = `${prnMed.name} cannot exceed ${maxDosePerAdministration} tablet${maxDosePerAdministration === 1 ? '' : 's'} per administration. You entered ${tabletsGivenNow} tablet${tabletsGivenNow === 1 ? '' : 's'}.`;
+                  showPrnLimitAlert(msg);
+                  return;
+                }
+
+                if (minHoursBetween && recordTimes.length > 0) {
+                  const lastTimeMs = Math.max(...recordTimes);
+                  const timeSinceLastMs = newTimeMs - lastTimeMs;
+                  const hoursSinceLast = timeSinceLastMs / (1000 * 60 * 60);
+
+                  if (hoursSinceLast < minHoursBetween) {
+                    const msg = `${prnMed.name} doses must be at least ${minHoursBetween} hour${minHoursBetween === 1 ? '' : 's'} apart. The last dose was ${hoursSinceLast.toFixed(1)} hour${hoursSinceLast.toFixed(1) === '1.0' ? '' : 's'} ago.`;
+                    showPrnLimitAlert(msg);
+                    return;
+                  }
+                }
+
+                if (maxDosePer24Hours) {
+                  const twentyFourHoursAgo = newTimeMs - (24 * 60 * 60 * 1000);
+                  const recentRecords = givenRecords.filter(r => {
+                    const recTime = parseDateTimeFlexibleMs(r.actualTime || r.time);
+                    return typeof recTime === 'number' && !Number.isNaN(recTime) && recTime >= twentyFourHoursAgo;
+                  });
+
+                  let tabletsInLast24Hours = 0;
+                  for (let i = 0; i < recentRecords.length; i += 1) {
+                    const recMed = prnMed;
+                    if (recMed.totalDose && recMed.dosePerTablet) {
+                      const calculated = parseFloat(recMed.totalDose) / parseFloat(recMed.dosePerTablet);
+                      if (!isNaN(calculated) && isFinite(calculated)) {
+                        tabletsInLast24Hours += calculated;
+                      }
+                    }
+                  }
+
+                  const totalAfterThisDose = tabletsInLast24Hours + tabletsGivenNow;
+
+                  if (totalAfterThisDose > maxDosePer24Hours) {
+                    const msg = `${prnMed.name} cannot exceed ${maxDosePer24Hours} tablet${maxDosePer24Hours === 1 ? '' : 's'} in 24 hours. Currently ${tabletsInLast24Hours} tablet${tabletsInLast24Hours === 1 ? '' : 's'} have been given in the last 24 hours. This dose would bring the total to ${totalAfterThisDose} tablet${totalAfterThisDose === 1 ? '' : 's'}.`;
+                    showPrnLimitAlert(msg);
+                    return;
+                  }
+                }
+              }
+            }
+          }
+
+          await addAdministrationRecord(
+            locationId,
+            localClient.id,
+            recordToSave.medId,
+            recordToSave.time,
+            'given',
+            actualTimeForRecord,
+            undefined,
+            quantityForThisRecord
+          );
+
+          const data = await loadData();
+          const loc = data.find(l => l.id === locationId);
+          const client = loc?.clients.find(c => c.id === localClient.id);
+          const med = client?.medications?.find(m => m.id === recordToSave.medId);
+
+          const shouldDeductStock =
+            adminStatus === 'given' || (adminStatus === 'third-party' && adminThirdPartyStockHandling === 'own-stock');
+
+          if (shouldDeductStock && med && med.stock !== undefined && med.stock > 0) {
+            const quantityToDeduct = quantityForThisRecord;
+            if (typeof quantityToDeduct === 'number' && Number.isFinite(quantityToDeduct) && quantityToDeduct > 0) {
+              const updatedMed = { ...med, stock: Math.max(0, med.stock - quantityToDeduct) };
+              await updateMedication(locationId, localClient.id, updatedMed);
+            }
           }
         }
       } else {
-        const reason = notGivenReason === 'other' ? otherReason : notGivenReason;
-        const scheduledTime = new Date(adminRecord.time).toLocaleString();
-        const markedTime = new Date().toLocaleString();
-        const detailedReason = [
-          `Reason: ${reason}`,
-          `Marked as not given: ${markedTime}`,
-          `Originally scheduled: ${scheduledTime}`,
-          `Scheduled slot: ${adminScheduledTime}`
-        ].join(' | ');
-        await addAdministrationRecord(locationId, localClient.id, adminRecord.medId, adminRecord.time, 'missed', undefined, detailedReason);
+        const selectedReason = notGivenReason === 'other' ? otherReason : notGivenReason;
+        const reason = (selectedReason || 'not specified').trim();
+
+        for (const recordToSave of recordsToSave) {
+          const medAtRecordTime = localClient.medications?.find(m => m.id === recordToSave.medId);
+          const stockAtRecordTime = getNumericStock(medAtRecordTime);
+          if (typeof stockAtRecordTime === 'number' && stockAtRecordTime <= 0 && medAtRecordTime?.name) {
+            outOfStockRecordedMeds.add(medAtRecordTime.name);
+          }
+
+          const scheduledTime = new Date(recordToSave.time).toLocaleString();
+          const markedTime = new Date().toLocaleString();
+          const detailedReason = [
+            `Reason: ${reason}`,
+            `Marked as not given: ${markedTime}`,
+            `Originally scheduled: ${scheduledTime}`,
+            `Scheduled slot: ${getSlotNameFromTime(recordToSave.time)}`
+          ].join(' | ');
+          await addAdministrationRecord(locationId, localClient.id, recordToSave.medId, recordToSave.time, 'missed', undefined, detailedReason);
+        }
       }
       
       // Clear all state
       setRecordingAdmin(false);
       setAdminRecord(null);
+      setAdminRecordsBatch([]);
       setAdminStatus(null);
-      setGivenTime('');
       setNotGivenReason('');
       setOtherReason('');
       setAdministeredBy('');
       setAdminScheduledTime('');
       setAdminActualTime('');
+      setAdminActualTimesByKey({});
       setAdminTabletsGiven('');
+      setAdminThirdPartyStockHandling('already-transferred');
       setAdminNotes('');
+      setSelectedTimelineItems([]);
+      setAdminSaveBlockReason('');
       
       // Refresh data from storage
       await refreshLocal();
-      
-      console.log('[SAVE_ADMIN] Success!');
-      showSuccess('Medication recorded successfully');
+
+      const shouldPromptStockReview =
+        outOfStockRecordedMeds.size > 0 ||
+        (adminStatus === 'not-given' && notGivenReason === 'out-of-stock');
+
+      const successMessage =
+        recordsToSave.length > 1
+          ? `${recordsToSave.length} medications recorded successfully`
+          : 'Medication recorded successfully';
+
+      if (shouldPromptStockReview) {
+        const medNames = Array.from(outOfStockRecordedMeds).join(', ');
+        const medSuffix = medNames ? ` (${medNames})` : '';
+        Alert.alert(
+          'Stock Review Required',
+          `You recorded an administration for out-of-stock medication${medSuffix}. Please review Stock Management and conduct a medication count.`,
+          [
+            {
+              text: 'OK',
+              onPress: () => showSuccess(successMessage),
+            },
+          ]
+        );
+      } else {
+        showSuccess(successMessage);
+      }
     } catch (e) {
-      console.error('[SAVE_ADMIN] Error:', e);
       logError(e, 'Save Administration Record');
+      setAdminSaveBlockReason('Failed to record administration. Please review the details and try again.');
       showError(e, 'Failed to record administration');
     }
   }
@@ -843,6 +1442,263 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
     }
   }
 
+  function collectAllHistoryRecords() {
+    if (!localClient) return [] as { medName: string; time: string; actualTime?: string; status: string; reason?: string }[];
+    const allRecords: { medName: string; time: string; actualTime?: string; status: string; reason?: string }[] = [];
+    (localClient.medications || []).forEach(m => {
+      (m.administrationRecords || []).forEach(r => {
+        allRecords.push({ medName: m.name, time: r.time, actualTime: r.actualTime, status: r.status, reason: r.reason });
+      });
+    });
+    (localClient.archivedMedicationHistory || []).forEach(archived => {
+      (archived.records || []).forEach(r => {
+        allRecords.push({ medName: archived.medName, time: r.time, actualTime: r.actualTime, status: r.status, reason: r.reason });
+      });
+    });
+    allRecords.sort((a, b) => new Date(b.actualTime || b.time).getTime() - new Date(a.actualTime || a.time).getTime());
+    return allRecords;
+  }
+
+  function sanitizePdfText(value: string): string {
+    return value
+      .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
+      .replace(/[\u0000-\u001F]/g, ' ')
+      .replace(/[\u0080-\uFFFF]/g, '?');
+  }
+
+  function buildSimplePdf(lines: string[]): Blob {
+    const escapePdf = (text: string) => sanitizePdfText(text).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+    const textCmd = (text: string, size: number, x: number, y: number, r: number, g: number, b: number) => (
+      `BT /F1 ${size} Tf ${r} ${g} ${b} rg ${x} ${y} Td (${escapePdf(text)}) Tj ET`
+    );
+    const rectCmd = (r: number, g: number, b: number, x: number, y: number, w: number, h: number) => (
+      `${r} ${g} ${b} rg ${x} ${y} ${w} ${h} re f`
+    );
+    const wrapText = (text: string, maxWidth: number, fontSize: number): string[] => {
+      const approxCharWidth = fontSize * 0.52;
+      const maxChars = Math.max(12, Math.floor(maxWidth / approxCharWidth));
+      const words = text.split(/\s+/).filter(Boolean);
+      if (words.length === 0) return [''];
+
+      const wrapped: string[] = [];
+      let current = '';
+      words.forEach(word => {
+        if (word.length > maxChars) {
+          if (current) {
+            wrapped.push(current);
+            current = '';
+          }
+          for (let i = 0; i < word.length; i += maxChars) {
+            wrapped.push(word.slice(i, i + maxChars));
+          }
+          return;
+        }
+        const candidate = current ? `${current} ${word}` : word;
+        if (candidate.length <= maxChars) {
+          current = candidate;
+        } else {
+          if (current) wrapped.push(current);
+          current = word;
+        }
+      });
+      if (current) wrapped.push(current);
+      return wrapped;
+    };
+
+    const sourceLines = lines.length > 0 ? lines : ['No data available'];
+    const titleLine = sanitizePdfText(sourceLines.find(l => l.trim()) || 'Medication Summary Report');
+    const bodyLines = sourceLines[0]?.trim() ? sourceLines.slice(1) : sourceLines;
+    const margin = 40;
+    const pageWidth = 612;
+    const pageHeight = 842;
+    const contentWidth = pageWidth - (margin * 2);
+    const minY = 52;
+    const pages: string[] = [];
+    let pageNumber = 1;
+    let currentY = 0;
+    let commands: string[] = [];
+
+    const startPage = () => {
+      commands = [];
+      commands.push(rectCmd(0.99, 0.995, 1, 0, 0, pageWidth, pageHeight));
+      commands.push(rectCmd(0.11, 0.39, 0.86, 0, 782, pageWidth, 60));
+      commands.push(textCmd(titleLine, 16, margin, 806, 1, 1, 1));
+      commands.push(textCmd(`Page ${pageNumber}`, 10, pageWidth - 88, 808, 0.9, 0.96, 1));
+      currentY = 760;
+    };
+
+    const finalizePage = () => {
+      commands.push(rectCmd(0.87, 0.91, 0.96, margin, 35, contentWidth, 1));
+      commands.push(textCmd('Generated by MedSuccess', 9, margin, 20, 0.45, 0.5, 0.58));
+      pages.push(commands.join('\n'));
+      pageNumber += 1;
+    };
+
+    const ensureSpace = (requiredHeight: number) => {
+      if (currentY - requiredHeight < minY) {
+        finalizePage();
+        startPage();
+      }
+    };
+
+    startPage();
+
+    bodyLines.forEach(rawLine => {
+      const line = sanitizePdfText(rawLine || '');
+      const trimmed = line.trim();
+      if (!trimmed) {
+        currentY -= 8;
+        return;
+      }
+
+      const isSectionHeader = /^[A-Z][A-Z0-9\s():-]{3,}$/.test(trimmed) && !/^Generated:/i.test(trimmed);
+      if (isSectionHeader) {
+        ensureSpace(28);
+        commands.push(rectCmd(0.9, 0.95, 1, margin, currentY - 14, contentWidth, 20));
+        commands.push(textCmd(trimmed, 11, margin + 8, currentY - 1, 0.11, 0.32, 0.66));
+        currentY -= 28;
+        return;
+      }
+
+      let fontSize = 10;
+      let color: [number, number, number] = [0.2, 0.24, 0.29];
+      let indent = 0;
+      if (/^Generated:/i.test(trimmed)) {
+        fontSize = 10;
+        color = [0.44, 0.5, 0.58];
+      } else if (/^\d+\./.test(trimmed)) {
+        fontSize = 10.5;
+        color = [0.12, 0.18, 0.25];
+      } else if (/^(Details:|Scheduled:|Actual:|Reason\/Notes:)/i.test(trimmed)) {
+        fontSize = 9.5;
+        indent = 16;
+        color = [0.35, 0.4, 0.48];
+      }
+
+      const wrapped = wrapText(trimmed, contentWidth - indent, fontSize);
+      const lineHeight = Math.max(12, Math.round(fontSize + 2));
+      ensureSpace((wrapped.length * lineHeight) + 2);
+      wrapped.forEach(chunk => {
+        commands.push(textCmd(chunk, fontSize, margin + indent, currentY, color[0], color[1], color[2]));
+        currentY -= lineHeight;
+      });
+    });
+
+    finalizePage();
+
+    const objects: string[] = [];
+    const addObject = (obj: string) => {
+      objects.push(obj);
+      return objects.length;
+    };
+
+    const catalogObj = addObject('<< /Type /Catalog /Pages 2 0 R >>');
+    const pagesObj = addObject('<< /Type /Pages /Kids [] /Count 0 >>');
+    const pageCount = pages.length;
+    const firstPageObjNum = 3;
+    const fontObjNum = firstPageObjNum + pageCount * 2;
+    const pageRefs: string[] = [];
+
+    pages.forEach((stream, pageIndex) => {
+      const pageObjNum = firstPageObjNum + pageIndex * 2;
+      const contentObjNum = pageObjNum + 1;
+      pageRefs.push(`${pageObjNum} 0 R`);
+      const streamLen = new TextEncoder().encode(stream).length;
+
+      addObject(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 ${fontObjNum} 0 R >> >> /Contents ${contentObjNum} 0 R >>`);
+      addObject(`<< /Length ${streamLen} >>\nstream\n${stream}\nendstream`);
+    });
+
+    addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+    objects[pagesObj - 1] = `<< /Type /Pages /Kids [${pageRefs.join(' ')}] /Count ${pageCount} >>`;
+
+    let pdf = '%PDF-1.4\n';
+    const offsets: number[] = [0];
+    objects.forEach((obj, idx) => {
+      offsets.push(new TextEncoder().encode(pdf).length);
+      pdf += `${idx + 1} 0 obj\n${obj}\nendobj\n`;
+    });
+
+    const xrefOffset = new TextEncoder().encode(pdf).length;
+    pdf += `xref\n0 ${objects.length + 1}\n`;
+    pdf += '0000000000 65535 f \n';
+    for (let i = 1; i <= objects.length; i++) {
+      pdf += `${offsets[i].toString().padStart(10, '0')} 00000 n \n`;
+    }
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root ${catalogObj} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+
+    return new Blob([pdf], { type: 'application/pdf' });
+  }
+
+  function downloadSevenDayHistoryPdf() {
+    if (!localClient) return;
+    const now = Date.now();
+    const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
+    const records = collectAllHistoryRecords().filter(r => {
+      const eventTime = new Date(r.actualTime || r.time).getTime();
+      return !Number.isNaN(eventTime) && eventTime >= sevenDaysAgo;
+    });
+
+    const stockEvents = records.filter(r => r.status === 'stock-adjustment' || /stock/i.test(r.reason || '') || r.status === 'created');
+
+    const lines: string[] = [];
+    lines.push('MEDICATION SUMMARY REPORT (LAST 7 DAYS)');
+    lines.push(`Generated: ${new Date().toLocaleString()}`);
+    lines.push('');
+    lines.push('CLIENT IDENTIFICATION');
+    lines.push(`Name: ${localClient.name}`);
+    lines.push(`Date of Birth: ${localClient.dob || 'N/A'}`);
+    lines.push(`Gender: ${localClient.gender || 'N/A'}`);
+    lines.push(`Medicare Number: ${localClient.medicareNumber || 'N/A'}`);
+    lines.push(`Contact Email: ${localClient.contactEmail || 'N/A'}`);
+    lines.push(`Allergies: ${localClient.allergies || 'None listed'}`);
+    lines.push('');
+    lines.push(`Total events in last 7 days: ${records.length}`);
+    lines.push(`Stock management events: ${stockEvents.length}`);
+    lines.push('');
+    lines.push('STOCK MANAGEMENT EVENTS');
+    if (stockEvents.length === 0) {
+      lines.push('No stock management events recorded in this period.');
+    } else {
+      stockEvents.forEach((r, idx) => {
+        lines.push(`${idx + 1}. ${new Date(r.actualTime || r.time).toLocaleString()} | ${r.medName} | ${r.status}`);
+        if (r.reason) lines.push(`   Details: ${r.reason}`);
+      });
+    }
+    lines.push('');
+    lines.push('ADMINISTRATION HISTORY (LAST 7 DAYS)');
+    if (records.length === 0) {
+      lines.push('No administration records for this period.');
+    } else {
+      records.forEach((r, idx) => {
+        lines.push(`${idx + 1}. ${new Date(r.actualTime || r.time).toLocaleString()} | ${r.medName} | ${r.status}`);
+        lines.push(`   Scheduled: ${new Date(r.time).toLocaleString()}`);
+        if (r.actualTime) lines.push(`   Actual: ${new Date(r.actualTime).toLocaleString()}`);
+        if (r.reason) lines.push(`   Reason/Notes: ${r.reason}`);
+      });
+    }
+
+    try {
+      const blob = buildSimplePdf(lines);
+      const dateStr = new Date().toISOString().split('T')[0];
+      const fileName = `${localClient.name}-7-day-history-${dateStr}.pdf`;
+      if (typeof window !== 'undefined' && window.navigator && (window.navigator as any).msSaveOrOpenBlob) {
+        (window.navigator as any).msSaveOrOpenBlob(blob, fileName);
+      } else if (typeof document !== 'undefined') {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+      showSuccess('7 day PDF summary downloaded successfully');
+    } catch (e) {
+      logError(e, 'Download 7 Day PDF Summary');
+      showError(e, 'Failed to generate 7 day PDF summary');
+    }
+  }
+
   function downloadHistoryCsv(): boolean {
     if (!localClient) return false;
     const rows: string[] = [];
@@ -952,7 +1808,94 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
     return a.prn ? -1 : 1;
   });
 
-  function handleTimelineRecord(item: { medId: string; medName: string; time: string; totalDose?: string; med: Medication }) {
+  const selectedTimelineKeys = new Set(selectedTimelineItems.map(item => `${item.medId}::${item.time}`));
+
+  function toggleTimelineMultiSelect(item: TimelineSelectableItem) {
+    if (!localClient) return;
+
+    const status = getAdministrationStatus(item.medId, item.time, item.med);
+    if (status === 'given') return;
+
+    if (selectedTimelineClientId && selectedTimelineClientId !== localClient.id) {
+      setSelectedTimelineItems([]);
+    }
+
+    setSelectedTimelineClientId(localClient.id);
+    const itemKey = `${item.medId}::${item.time}`;
+    setSelectedTimelineItems(prev => {
+      const exists = prev.some(selected => `${selected.medId}::${selected.time}` === itemKey);
+      if (exists) {
+        return prev.filter(selected => `${selected.medId}::${selected.time}` !== itemKey);
+      }
+      return [...prev, item];
+    });
+  }
+
+  function openAdministrationForSelection() {
+    if (selectedTimelineItems.length === 0) return;
+
+    const sorted = [...selectedTimelineItems].sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+    const first = sorted[0];
+
+    let calculatedTablets = '';
+    if (first.med.totalDose && first.med.dosePerTablet) {
+      const calculated = parseFloat(first.med.totalDose) / parseFloat(first.med.dosePerTablet);
+      if (!isNaN(calculated) && isFinite(calculated)) {
+        calculatedTablets = calculated.toFixed(2);
+      }
+    }
+
+    const formatCount = (value: number): string => {
+      if (!Number.isFinite(value)) return '';
+      return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.00$/, '');
+    };
+
+    const getPresetDoseSummary = (med: Medication): string => {
+      const totalDoseText = formatDoseWithUnit(med.totalDose, med.unit);
+      const dosePerTablet = parseFloat(String(med.dosePerTablet || ''));
+      const totalDose = parseFloat(String(med.totalDose || ''));
+      const route = (med.route || '').toLowerCase();
+
+      if (totalDoseText && Number.isFinite(totalDose) && Number.isFinite(dosePerTablet) && dosePerTablet > 0) {
+        const quantity = totalDose / dosePerTablet;
+        const perItemStrength = formatDoseWithUnit(String(dosePerTablet), med.unit);
+        const itemLabel = route.includes('capsule') ? 'caps' : route.includes('tablet') ? 'tabs' : 'units';
+        return `${totalDoseText} (${formatCount(quantity)}x ${perItemStrength} ${itemLabel})`;
+      }
+
+      return totalDoseText || 'Dose not set';
+    };
+
+    const batchRecords = sorted.map(record => ({
+      medId: record.medId,
+      time: record.time,
+      medName: record.medName,
+      presetDoseSummary: getPresetDoseSummary(record.med),
+      dueDisplay: `${new Date(record.time).toLocaleDateString()} - ${getSlotNameFromTime(record.time)}`,
+    }));
+    setAdminRecordsBatch(batchRecords);
+    setAdminRecord(batchRecords[0]);
+    setAdminScheduledTime(sorted.length > 1 ? `${sorted.length} selected timeline entries` : getSlotNameFromTime(first.time));
+    setAdminEntrySource('timeline');
+    setAdminSaveBlockReason('');
+    setRecordingAdmin(true);
+    setAdminStatus(null);
+    setAdminActualTime('');
+    setAdminActualTimesByKey({});
+    setAdminTabletsGiven(calculatedTablets);
+    setAdminNotes('');
+    setAdministeredBy('');
+    setNotGivenReason('');
+    setOtherReason('');
+  }
+
+  function handleTimelineRecord(item: TimelineSelectableItem) {
+    const selectedMatch = selectedTimelineItems.find(selected => selected.medId === item.medId && selected.time === item.time);
+    if (selectedTimelineItems.length > 1 && selectedMatch) {
+      openAdministrationForSelection();
+      return;
+    }
+
     // Check if the medication at this time is already given
     const status = getAdministrationStatus(item.medId, item.time, item.med);
     
@@ -973,13 +1916,21 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
       }
 
       setAdminRecord({ medId: item.medId, time: item.time, medName: item.medName });
+      setAdminRecordsBatch([]);
       setAdminScheduledTime(getSlotNameFromTime(item.time));
+      setAdminEntrySource('timeline');
+      setAdminSaveBlockReason('');
       setRecordingAdmin(true);
       setAdminStatus(null);
       setAdminActualTime('');
+      setAdminActualTimesByKey({});
       setAdminTabletsGiven(calculatedTablets);
       setAdminNotes('');
     }
+  }
+
+  function openAddMedicationWithAcknowledgement() {
+    setShowAddMedicationPrompt(true);
   }
 
   return (
@@ -999,16 +1950,16 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
           {localClient.contactEmail && <Text style={styles.clientEmail}>📧 {localClient.contactEmail}</Text>}
         </View>
         <View style={styles.headerActionsRow}>
-          <TouchableOpacity onPress={() => { setClientDraft({ name: localClient.name, dob: localClient.dob || '', allergies: localClient.allergies || '', gender: localClient.gender, weight: localClient.weight, contactEmail: localClient.contactEmail, gp: localClient.gp || '', gpClinic: localClient.gpClinic || '', medicareNumber: localClient.medicareNumber || '', photoUri: localClient.photoUri || '' }); setEditingClient(true); }} style={[styles.headerAction, { marginRight: 8 }]}> 
+          <TouchableOpacity onPress={() => { setClientDraft({ name: localClient.name, dob: localClient.dob || '', allergies: localClient.allergies || '', additionalInfo: localClient.additionalInfo || '', gender: localClient.gender, weight: localClient.weight, contactEmail: localClient.contactEmail, gp: localClient.gp || '', gpClinic: localClient.gpClinic || '', medicareNumber: localClient.medicareNumber || '', photoUri: localClient.photoUri || '' }); setEditClientLocationId(locationId || ''); setEditingClient(true); }} style={[styles.headerAction, { marginRight: 8 }]}> 
             <Text style={styles.headerActionText}>Edit Client</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={downloadSummary} style={[styles.headerAction, { marginRight: 8 }]}> 
+          <TouchableOpacity onPress={() => setShowSummaryOptions(true)} style={[styles.headerAction, { marginRight: 8 }]}> 
             <Text style={styles.headerActionText}>Download Summary</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => navigation.navigate('StockManagement', { clientId: localClient.id, locationId, clientName: localClient.name })} style={[styles.headerAction, { marginRight: 8 }]}>
             <Text style={styles.headerActionText}>Stock Management</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={() => setShowAddMedication(true)} style={styles.headerAction}>
+          <TouchableOpacity onPress={openAddMedicationWithAcknowledgement} style={styles.headerAction}>
             <Text style={styles.headerActionText}>+ Add Med</Text>
           </TouchableOpacity>
         </View>
@@ -1034,9 +1985,19 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
           renderItem={({ item }) => (
             <View style={styles.medRow}>
               <View style={styles.medInfo}>
-                <Text style={styles.medName}>{item.name}</Text>
-                {item.totalDose ? <Text style={styles.medDetail}>{item.totalDose}</Text> : null}
-                {item.dosePerTablet ? <Text style={styles.medDetail}>Per tablet: {item.dosePerTablet}</Text> : null}
+                <Text style={styles.medName}>
+                  {item.name}
+                  {item.medicationPurpose ? (
+                    <Text style={{ fontSize: 12, fontWeight: '500', color: '#64748b' }}>{` (${item.medicationPurpose})`}</Text>
+                  ) : null}
+                </Text>
+                {Number.isFinite(Number.parseFloat(String(item.totalDose || '').trim())) ? (
+                  <Text style={styles.medDetail}>Prescribed dose: {formatDoseWithUnit(item.totalDose, item.unit)}</Text>
+                ) : null}
+                {!!String(item.variableDoseInstructions || '').trim() ? (
+                  <Text style={styles.medDetail}>Dose instructions: {String(item.variableDoseInstructions || '').trim()}</Text>
+                ) : null}
+                {item.dosePerTablet ? <Text style={styles.medDetail}>Per tablet: {formatDoseWithUnit(item.dosePerTablet, item.unit)}</Text> : null}
                 {item.route ? <Text style={styles.medDetail}>{item.route}</Text> : null}
                 {item.startTime && <Text style={styles.medTimeSmall}>📅 From: {new Date(item.startTime).toLocaleDateString()}</Text>}
                 {item.endTime && <Text style={styles.medTimeSmall}>📅 Until: {new Date(item.endTime).toLocaleDateString()}</Text>}
@@ -1059,7 +2020,10 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
 
                       const nowIso = new Date().toISOString();
                       setAdminRecord({ medId: item.id, time: nowIso, medName: item.name });
+                      setAdminRecordsBatch([]);
                       setAdminScheduledTime('PRN');
+                      setAdminEntrySource('medications');
+                      setAdminSaveBlockReason('');
                       setRecordingAdmin(true);
                       setAdminStatus('given');
                       setAdminActualTime('');
@@ -1083,41 +2047,236 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
       )}
 
       {tab === 'timeline' && (
-        <TimelineList meds={meds} styles={styles} onRecord={handleTimelineRecord} />
+        <View style={{ flex: 1 }}>
+          {selectedTimelineItems.length > 0 && (
+            <View style={styles.timelineMultiSelectBar}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.timelineMultiSelectTitle}>{selectedTimelineItems.length} selected</Text>
+                <Text style={styles.timelineMultiSelectSummary} numberOfLines={2}>
+                  {selectedTimelineItems
+                    .slice(0, 3)
+                    .map(i => `${i.medName} @ ${new Date(i.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`)
+                    .join(' • ')}
+                  {selectedTimelineItems.length > 3 ? ` +${selectedTimelineItems.length - 3} more` : ''}
+                </Text>
+              </View>
+              <TouchableOpacity style={styles.timelineMultiSelectAction} onPress={openAdministrationForSelection}>
+                <Text style={styles.timelineMultiSelectActionText}>Record Selected</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.timelineMultiSelectClear} onPress={() => setSelectedTimelineItems([])}>
+                <Text style={styles.timelineMultiSelectClearText}>Clear</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          <TimelineList
+            meds={meds}
+            styles={styles}
+            onRecord={handleTimelineRecord}
+            selectedKeys={selectedTimelineKeys}
+            onToggleSelect={toggleTimelineMultiSelect}
+          />
+        </View>
       )}
 
       {tab === 'history' && (
         <View style={{ flex: 1 }}>
           <View style={{ paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#e5e7eb' }}>
-            <TextInput
-              placeholder="Search history (medication, status, reason)..."
-              value={historySearchQuery}
-              onChangeText={setHistorySearchQuery}
-              style={{
-                paddingHorizontal: 12,
-                paddingVertical: 8,
-                borderRadius: 6,
-                borderWidth: 1,
-                borderColor: '#d1d5db',
-                fontSize: 13,
-                backgroundColor: '#f9fafb',
-              }}
-            />
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <TextInput
+                placeholder="Search history (medication, status, reason)..."
+                value={historySearchQuery}
+                onChangeText={setHistorySearchQuery}
+                style={{
+                  flex: 1,
+                  paddingHorizontal: 12,
+                  paddingVertical: 8,
+                  borderRadius: 6,
+                  borderWidth: 1,
+                  borderColor: '#d1d5db',
+                  fontSize: 13,
+                  backgroundColor: '#f9fafb',
+                }}
+              />
+              <TouchableOpacity
+                onPress={() => setShowHistoryFilters(true)}
+                style={{
+                  marginLeft: 8,
+                  paddingHorizontal: 12,
+                  paddingVertical: 8,
+                  borderRadius: 6,
+                  borderWidth: 1,
+                  borderColor: activeHistoryFilterCount > 0 ? '#2563eb' : '#d1d5db',
+                  backgroundColor: activeHistoryFilterCount > 0 ? '#dbeafe' : '#f8fafc',
+                }}
+              >
+                <Text style={{ fontSize: 12, fontWeight: '700', color: activeHistoryFilterCount > 0 ? '#1d4ed8' : '#334155' }}>
+                  Filters{activeHistoryFilterCount > 0 ? ` (${activeHistoryFilterCount})` : ''}
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
           <HistoryList client={localClient} styles={styles} filteredRecords={getFilteredHistoryRecords()} />
         </View>
       )}
 
+      <Modal visible={showHistoryFilters} transparent animationType="fade" onRequestClose={() => setShowHistoryFilters(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { width: '92%', maxWidth: 520, maxHeight: '86%' }]}>
+            <Text style={styles.modalTitle}>History Filters</Text>
+            <ScrollView>
+              <Text style={styles.modalLabel}>Date range</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+                {[
+                  { label: 'All', value: 'all' },
+                  { label: 'Today', value: 'today' },
+                  { label: 'Last 7 days', value: 'last7' },
+                  { label: 'Last 30 days', value: 'last30' },
+                ].map(option => (
+                  <TouchableOpacity
+                    key={option.value}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: historyDatePreset === option.value ? '#2563eb' : '#cbd5e1',
+                      backgroundColor: historyDatePreset === option.value ? '#dbeafe' : '#fff',
+                      borderRadius: 16,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                    }}
+                    onPress={() => setHistoryDatePreset(option.value as any)}
+                  >
+                    <Text style={{ fontSize: 12, fontWeight: '600', color: historyDatePreset === option.value ? '#1d4ed8' : '#334155' }}>{option.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={styles.modalLabel}>Timing (given only)</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+                {[
+                  { label: 'All', value: 'all' },
+                  { label: 'On time', value: 'on-time' },
+                  { label: 'Early', value: 'early' },
+                  { label: 'Late', value: 'late' },
+                ].map(option => (
+                  <TouchableOpacity
+                    key={option.value}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: historyTimingFilter === option.value ? '#2563eb' : '#cbd5e1',
+                      backgroundColor: historyTimingFilter === option.value ? '#dbeafe' : '#fff',
+                      borderRadius: 16,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                    }}
+                    onPress={() => setHistoryTimingFilter(option.value as any)}
+                  >
+                    <Text style={{ fontSize: 12, fontWeight: '600', color: historyTimingFilter === option.value ? '#1d4ed8' : '#334155' }}>{option.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={styles.modalLabel}>Status</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+                {historyStatusOptions.map(status => (
+                  <TouchableOpacity
+                    key={status}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: historySelectedStatuses.includes(status) ? '#2563eb' : '#cbd5e1',
+                      backgroundColor: historySelectedStatuses.includes(status) ? '#dbeafe' : '#fff',
+                      borderRadius: 16,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                    }}
+                    onPress={() => toggleHistoryStatus(status)}
+                  >
+                    <Text style={{ fontSize: 12, fontWeight: '600', color: historySelectedStatuses.includes(status) ? '#1d4ed8' : '#334155' }}>{status}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={styles.modalLabel}>Medication</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+                {historyMedicationOptions.map(medName => (
+                  <TouchableOpacity
+                    key={medName}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: historySelectedMeds.includes(medName) ? '#2563eb' : '#cbd5e1',
+                      backgroundColor: historySelectedMeds.includes(medName) ? '#dbeafe' : '#fff',
+                      borderRadius: 16,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                    }}
+                    onPress={() => toggleHistoryMedication(medName)}
+                  >
+                    <Text style={{ fontSize: 12, fontWeight: '600', color: historySelectedMeds.includes(medName) ? '#1d4ed8' : '#334155' }}>{medName}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={styles.modalLabel}>Other options</Text>
+              <TouchableOpacity
+                style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}
+                onPress={() => setHistoryHasReasonOnly(v => !v)}
+              >
+                <View style={{ width: 18, height: 18, borderWidth: 1.5, borderColor: '#2563eb', borderRadius: 4, marginRight: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: historyHasReasonOnly ? '#2563eb' : '#fff' }}>
+                  {historyHasReasonOnly ? <Text style={{ color: '#fff', fontWeight: '700', fontSize: 11 }}>✓</Text> : null}
+                </View>
+                <Text style={{ fontSize: 13, color: '#334155', fontWeight: '600' }}>Show entries with reason only</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}
+                onPress={() => setHistoryIncludeStockAdjustments(v => !v)}
+              >
+                <View style={{ width: 18, height: 18, borderWidth: 1.5, borderColor: '#2563eb', borderRadius: 4, marginRight: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: historyIncludeStockAdjustments ? '#2563eb' : '#fff' }}>
+                  {historyIncludeStockAdjustments ? <Text style={{ color: '#fff', fontWeight: '700', fontSize: 11 }}>✓</Text> : null}
+                </View>
+                <Text style={{ fontSize: 13, color: '#334155', fontWeight: '600' }}>Include stock adjustments</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}
+                onPress={() => {
+                  setHistoryOnlyStockAdjustments(v => !v);
+                  setHistoryIncludeStockAdjustments(true);
+                }}
+              >
+                <View style={{ width: 18, height: 18, borderWidth: 1.5, borderColor: '#2563eb', borderRadius: 4, marginRight: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: historyOnlyStockAdjustments ? '#2563eb' : '#fff' }}>
+                  {historyOnlyStockAdjustments ? <Text style={{ color: '#fff', fontWeight: '700', fontSize: 11 }}>✓</Text> : null}
+                </View>
+                <Text style={{ fontSize: 13, color: '#334155', fontWeight: '600' }}>Only stock adjustments (includes medication creation)</Text>
+              </TouchableOpacity>
+            </ScrollView>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={[styles.modalBtn, styles.modalCancel]} onPress={clearAllHistoryFilters}>
+                <Text style={styles.modalBtnText}>Clear all</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, styles.modalSave]} onPress={() => setShowHistoryFilters(false)}>
+                <Text style={[styles.modalBtnText, { color: '#fff' }]}>Apply</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       <AdminRecordModal
         visible={recordingAdmin && !!adminRecord}
         adminRecord={adminRecord}
+        adminRecords={adminRecordsBatch}
         adminStatus={adminStatus}
         setAdminStatus={setAdminStatus}
         adminScheduledTime={adminScheduledTime}
         adminActualTime={adminActualTime}
         setAdminActualTime={setAdminActualTime}
+        adminActualTimesByKey={adminActualTimesByKey}
+        setAdminActualTimesByKey={setAdminActualTimesByKey}
         adminTabletsGiven={adminTabletsGiven}
         setAdminTabletsGiven={setAdminTabletsGiven}
+        thirdPartyStockHandling={adminThirdPartyStockHandling}
+        setThirdPartyStockHandling={setAdminThirdPartyStockHandling}
         adminNotes={adminNotes}
         setAdminNotes={setAdminNotes}
         administeredBy={administeredBy}
@@ -1126,16 +2285,106 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
         setNotGivenReason={setNotGivenReason}
         otherReason={otherReason}
         setOtherReason={setOtherReason}
-        medRoute={localClient?.medications?.find(m => m.id === adminRecord?.medId)?.route}
-        isPrn={!!localClient?.medications?.find(m => m.id === adminRecord?.medId)?.prn}
+        medRoute={activeAdminMedication?.route}
+        medStock={activeAdminMedication?.stock}
+        medTotalDose={activeAdminMedication?.totalDose}
+        medDosePerTablet={activeAdminMedication?.dosePerTablet}
+        isPrn={!!activeAdminMedication?.prn}
+        activeMedication={activeAdminMedication}
+        showStockReviewNotice
+        externalBlockingReason={adminSaveBlockReason}
         onCancel={() => {
           setAdminStatus(null);
-          if (!adminStatus) setRecordingAdmin(false);
+          setAdminThirdPartyStockHandling('already-transferred');
+          if (!adminStatus) {
+            setRecordingAdmin(false);
+            setAdminRecordsBatch([]);
+            setAdminActualTimesByKey({});
+            setAdminEntrySource(null);
+            setAdminSaveBlockReason('');
+          }
         }}
         onSave={saveAdministrationRecord}
-        canSave={canSaveAdmin}
         styles={styles}
       />
+
+      <Modal
+        visible={showOutOfStockReviewPrompt}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowOutOfStockReviewPrompt(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { width: '88%', maxWidth: 420 }]}> 
+            <Text style={styles.modalTitle}>Stock Review Required</Text>
+            <Text style={{ fontSize: 13, color: '#4b5563', lineHeight: 20, marginBottom: 16 }}>
+              {outOfStockReviewMessage}
+            </Text>
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalCancel]}
+                onPress={() => {
+                  setShowOutOfStockReviewPrompt(false);
+                  setPendingOutOfStockBypassPrn(undefined);
+                }}
+              >
+                <Text style={styles.modalBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalSave]}
+                onPress={() => {
+                  const bypassPrn = pendingOutOfStockBypassPrn;
+                  setShowOutOfStockReviewPrompt(false);
+                  setPendingOutOfStockBypassPrn(undefined);
+                  saveAdministrationRecord(bypassPrn, true);
+                }}
+              >
+                <Text style={[styles.modalBtnText, { color: '#fff' }]}>Acknowledge and Save</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={showSummaryOptions} transparent animationType="fade" onRequestClose={() => setShowSummaryOptions(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { width: '88%', maxWidth: 420 }]}> 
+            <Text style={styles.modalTitle}>Download Summary</Text>
+            <Text style={{ fontSize: 13, color: '#4b5563', marginBottom: 14, lineHeight: 18 }}>
+              Choose which report you want to download.
+            </Text>
+
+            <TouchableOpacity
+              style={{ backgroundColor: '#2563eb', borderRadius: 8, paddingVertical: 12, paddingHorizontal: 12, marginBottom: 10 }}
+              onPress={() => {
+                setShowSummaryOptions(false);
+                downloadSummary();
+              }}
+            >
+              <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>Complete history (ZIP)</Text>
+              <Text style={{ color: '#dbeafe', fontSize: 11, marginTop: 3 }}>Full medication and administration export</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={{ backgroundColor: '#0f766e', borderRadius: 8, paddingVertical: 12, paddingHorizontal: 12, marginBottom: 14 }}
+              onPress={() => {
+                setShowSummaryOptions(false);
+                downloadSevenDayHistoryPdf();
+              }}
+            >
+              <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>7 day history (PDF)</Text>
+              <Text style={{ color: '#ccfbf1', fontSize: 11, marginTop: 3 }}>Includes client ID details and stock events</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.modalBtn, styles.modalCancel]}
+              onPress={() => setShowSummaryOptions(false)}
+            >
+              <Text style={styles.modalBtnText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       {/* Edit medication modal */}
       <Modal visible={editing && !!editMed} transparent animationType="fade">
@@ -1165,7 +2414,7 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
               <Text style={styles.modalLabel}>Medication Type *</Text>
               <TextInput 
                 value={editMed?.route || ''} 
-                onChangeText={(v) => setEditMed(m => m ? { ...m, route: v, dosePerTablet: v === 'Subcutaneous injection' ? '' : (m?.dosePerTablet || ''), dosePerTablet2: v === 'Subcutaneous injection' ? '' : (m?.dosePerTablet2 || ''), multipleDosesPerTablet: v === 'Subcutaneous injection' ? false : m?.multipleDosesPerTablet } : m)} 
+                onChangeText={(v) => setEditMed(m => m ? { ...m, route: v, dosePerTablet: v === 'Subcutaneous injection' ? '' : (m?.dosePerTablet || ''), dosePerTablet2: v === 'Subcutaneous injection' ? '' : (m?.dosePerTablet2 || ''), dosePerTablet2Unit: v === 'Subcutaneous injection' ? '' : (m?.dosePerTablet2Unit || m?.unit || 'mg'), multipleDosesPerTablet: v === 'Subcutaneous injection' ? false : m?.multipleDosesPerTablet } : m)} 
                 style={styles.modalInput} 
                 placeholder="e.g., Oral tablet, Oral capsule" 
               />
@@ -1179,7 +2428,7 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
                       setEditMultipleDosesPerTablet(!editMultipleDosesPerTablet);
                       if (editMultipleDosesPerTablet) {
                         setEditDosePerTablet2('');
-                        setEditMed(m => m ? { ...m, dosePerTablet2: '' } : m);
+                        setEditMed(m => m ? { ...m, dosePerTablet2: '', dosePerTablet2Unit: '' } : m);
                       }
                     }}
                   >
@@ -1187,7 +2436,7 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
                       {editMultipleDosesPerTablet && <Text style={{ color: '#fff', fontSize: 11, fontWeight: 'bold' }}>✓</Text>}
                     </View>
                     <Text style={{ fontSize: 12, color: '#333', flex: 1 }}>
-                      There is more than one medication per {editMed?.route === 'Oral tablet' ? 'tablet' : editMed?.route === 'Oral capsule' ? 'capsule' : 'unit'}
+                      There is more than one medication per {editMed?.route === 'Oral tablet' || editMed?.route === 'Oral capsule' || editMed?.route === 'Oral tablet/capsule' ? 'tablet/capsule' : 'unit'}
                     </Text>
                   </TouchableOpacity>
                   
@@ -1195,20 +2444,29 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
                   {editMultipleDosesPerTablet && (
                     <>
                       <Text style={styles.modalLabel}>
-                        Second {editMed?.route === 'Oral tablet' ? 'Dose per Tablet' : editMed?.route === 'Oral capsule' ? 'Dose per Capsule' : 'Dose per Unit'}
+                        Second {editMed?.route === 'Oral tablet' || editMed?.route === 'Oral capsule' || editMed?.route === 'Oral tablet/capsule' ? 'Dose per tablet/capsule' : 'Dose per Unit'}
                       </Text>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
+                      <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                        <View style={{ flex: 2 }}>
                         <TextInput 
                           value={editDosePerTablet2} 
                           onChangeText={(v) => {
                             setEditDosePerTablet2(v);
                             setEditMed(m => m ? { ...m, dosePerTablet2: v } : m);
                           }} 
-                          style={[styles.modalInput, { flex: 1, marginRight: 8 }]} 
+                          style={styles.modalInput} 
                           placeholder="e.g., 500"
                           keyboardType="decimal-pad"
                         />
-                        <Text style={{ fontSize: 11, fontWeight: '600', color: '#333' }}>{editMed?.unit || 'mg'}</Text>
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <TouchableOpacity
+                            style={[styles.modalInput, { justifyContent: 'center' }]}
+                            onPress={() => setShowEditSecondUnitDropdown(true)}
+                          >
+                            <Text style={{ fontSize: 12, fontWeight: '600', color: '#333' }}>{editMed?.dosePerTablet2Unit || editMed?.unit || 'mg'}</Text>
+                          </TouchableOpacity>
+                        </View>
                       </View>
                     </>
                   )}
@@ -1220,7 +2478,7 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
                 <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
                   <View style={{ flex: 2 }}>
                     <Text style={styles.modalLabel}>
-                      {editMed?.route === 'Oral tablet' ? 'Dose per Tablet' : editMed?.route === 'Oral capsule' ? 'Dose per Capsule' : 'Dose per Unit'}
+                      {editMed?.route === 'Oral tablet' || editMed?.route === 'Oral capsule' || editMed?.route === 'Oral tablet/capsule' ? 'Dose per tablet/capsule' : 'Dose per Unit'}
                     </Text>
                     <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                       <TextInput 
@@ -1271,20 +2529,38 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
 
               {/* Medication Schedule */}
               <Text style={styles.modalLabel}>Medication Schedule</Text>
-              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
-                <TouchableOpacity 
-                  style={[styles.scheduleTypeButton, !editPrn && styles.scheduleTypeButtonActive]}
-                  onPress={() => setEditPrn(false)}
-                >
-                  <Text style={[styles.scheduleTypeButtonText, !editPrn && styles.scheduleTypeButtonTextActive]}>⏰ Regular</Text>
-                  <Text style={[styles.scheduleTypeDesc, !editPrn && styles.scheduleTypeDescActive]}>Set times</Text>
-                </TouchableOpacity>
+              <View style={{ gap: 8, marginBottom: 12 }}>
                 <TouchableOpacity 
                   style={[styles.scheduleTypeButton, editPrn && styles.scheduleTypeButtonActive]}
-                  onPress={() => setEditPrn(true)}
+                  onPress={() => {
+                    setEditPrn(true);
+                    setEditCourseType('long-term');
+                    setEditEndDate('');
+                  }}
                 >
-                  <Text style={[styles.scheduleTypeButtonText, editPrn && styles.scheduleTypeButtonTextActive]}>📋 PRN</Text>
-                  <Text style={[styles.scheduleTypeDesc, editPrn && styles.scheduleTypeDescActive]}>As needed</Text>
+                  <Text style={[styles.scheduleTypeButtonText, editPrn && styles.scheduleTypeButtonTextActive]}>📋 Give when required</Text>
+                  <Text style={[styles.scheduleTypeDesc, editPrn && styles.scheduleTypeDescActive]}>Give when required (PRN)</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.scheduleTypeButton, !editPrn && editCourseType === 'long-term' && styles.scheduleTypeButtonActive]}
+                  onPress={() => {
+                    setEditPrn(false);
+                    setEditCourseType('long-term');
+                    setEditEndDate('');
+                  }}
+                >
+                  <Text style={[styles.scheduleTypeButtonText, !editPrn && editCourseType === 'long-term' && styles.scheduleTypeButtonTextActive]}>⏰ Long term course</Text>
+                  <Text style={[styles.scheduleTypeDesc, !editPrn && editCourseType === 'long-term' && styles.scheduleTypeDescActive]}>Ongoing schedule</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.scheduleTypeButton, !editPrn && editCourseType === 'short-term' && styles.scheduleTypeButtonActive]}
+                  onPress={() => {
+                    setEditPrn(false);
+                    setEditCourseType('short-term');
+                  }}
+                >
+                  <Text style={[styles.scheduleTypeButtonText, !editPrn && editCourseType === 'short-term' && styles.scheduleTypeButtonTextActive]}>🗓️ Short term course</Text>
+                  <Text style={[styles.scheduleTypeDesc, !editPrn && editCourseType === 'short-term' && styles.scheduleTypeDescActive]}>Time-limited schedule</Text>
                 </TouchableOpacity>
               </View>
 
@@ -1326,69 +2602,61 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
               {!editPrn && (
                 <>
                   <Text style={styles.modalLabel}>Frequency</Text>
-                  <View style={{ flexDirection: 'row', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
-                    {[
-                      { key: 'daily', label: 'Every Day' },
-                      { key: 'every-second-day', label: 'Every 2nd Day' },
-                      { key: 'weekly', label: 'Weekly' },
-                      { key: 'fortnightly', label: 'Fortnightly' }
-                    ].map(freq => (
-                      <TouchableOpacity
-                        key={freq.key}
-                        onPress={() => setEditFrequencyType(freq.key as any)}
-                        style={[
-                          { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 6, borderWidth: 1.5, borderColor: editFrequencyType === freq.key ? '#2563eb' : '#d1d5db', backgroundColor: editFrequencyType === freq.key ? '#dbeafe' : '#f9fafb', flex: 1, minWidth: '47%' },
-                        ]}
-                      >
-                        <Text style={{ fontSize: 11, fontWeight: '600', color: editFrequencyType === freq.key ? '#2563eb' : '#666', textAlign: 'center' }}>{freq.label}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
+                  <TouchableOpacity style={[styles.modalInput, { justifyContent: 'center' }]} onPress={() => setShowEditFrequencyDropdown(true)}>
+                    <Text style={{ color: '#111827', fontSize: 13, fontWeight: '600' }}>
+                      {editFrequencyType === 'daily' ? 'Every Day' : editFrequencyType === 'every-second-day' ? 'Every Second Day' : editFrequencyType === 'weekly' ? 'Weekly' : editFrequencyType === 'fortnightly' ? 'Fortnightly' : 'Monthly'}
+                    </Text>
+                  </TouchableOpacity>
 
                   {editFrequencyType === 'daily' && (
                     <>
-                      <Text style={{ fontWeight: '600', marginBottom: 8, color: '#333', fontSize: 12 }}>Select Times</Text>
-                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8, gap: 6 }}>
-                        <TouchableOpacity onPress={() => setSlots(s => ({ ...s, beforeBreakfast: !s.beforeBreakfast }))} style={[styles.slotBtn, slots.beforeBreakfast && styles.slotBtnActive]}>
-                          <Text style={[styles.slotText, slots.beforeBreakfast && styles.slotTextActive]}>Before breakfast</Text>
-                          <Text style={[styles.slotTime, slots.beforeBreakfast && styles.slotTextActive]}>07:30</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity onPress={() => setSlots(s => ({ ...s, breakfast: !s.breakfast }))} style={[styles.slotBtn, slots.breakfast && styles.slotBtnActive]}>
-                          <Text style={[styles.slotText, slots.breakfast && styles.slotTextActive]}>Breakfast</Text>
-                          <Text style={[styles.slotTime, slots.breakfast && styles.slotTextActive]}>08:00</Text>
-                        </TouchableOpacity>
-                      </View>
-                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8, gap: 6 }}>
-                        <TouchableOpacity onPress={() => setSlots(s => ({ ...s, lunch: !s.lunch }))} style={[styles.slotBtn, slots.lunch && styles.slotBtnActive]}>
-                          <Text style={[styles.slotText, slots.lunch && styles.slotTextActive]}>Lunch</Text>
-                          <Text style={[styles.slotTime, slots.lunch && styles.slotTextActive]}>12:00</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity onPress={() => setSlots(s => ({ ...s, dinner: !s.dinner }))} style={[styles.slotBtn, slots.dinner && styles.slotBtnActive]}>
-                          <Text style={[styles.slotText, slots.dinner && styles.slotTextActive]}>Dinner</Text>
-                          <Text style={[styles.slotTime, slots.dinner && styles.slotTextActive]}>18:00</Text>
-                        </TouchableOpacity>
-                      </View>
-                      <View style={{ flexDirection: 'row', justifyContent: 'center', marginBottom: 12 }}>
-                        <TouchableOpacity onPress={() => setSlots(s => ({ ...s, beforeBed: !s.beforeBed }))} style={[styles.slotBtn, slots.beforeBed && styles.slotBtnActive, { width: '48%' }]}>
-                          <Text style={[styles.slotText, slots.beforeBed && styles.slotTextActive]}>Before Bed</Text>
-                          <Text style={[styles.slotTime, slots.beforeBed && styles.slotTextActive]}>22:00</Text>
-                        </TouchableOpacity>
+                      <TouchableOpacity style={[styles.modalInput, { justifyContent: 'center' }]} onPress={() => setShowEditSlotsDropdown(true)}>
+                        <Text style={{ color: '#111827', fontSize: 13 }}>
+                          {Object.values(slots).filter(Boolean).length === 0 ? 'Select times...' : `${Object.values(slots).filter(Boolean).length} time${Object.values(slots).filter(Boolean).length !== 1 ? 's' : ''} selected`}
+                        </Text>
+                      </TouchableOpacity>
+
+                      <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginBottom: 10 }}>
+                        {slots.beforeBreakfast && <Text style={styles.slotTag}>Before Breakfast (05:00-10:00)</Text>}
+                        {slots.breakfast && <Text style={styles.slotTag}>Breakfast (06:00-10:00)</Text>}
+                        {slots.lunch && <Text style={styles.slotTag}>Lunch (10:00-15:00)</Text>}
+                        {slots.dinner && <Text style={styles.slotTag}>Dinner (16:00-22:00)</Text>}
+                        {slots.beforeBed && <Text style={styles.slotTag}>Before Bed (18:00-23:59)</Text>}
+                        {editCustomTimes.map((time, idx) => (
+                          <View key={idx} style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#dbeafe', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 16, marginRight: 8, marginBottom: 6 }}>
+                            <Text style={styles.slotTag}>{formatCustomTimeRange(time)} (Specific)</Text>
+                            <TouchableOpacity onPress={() => setEditCustomTimes(t => t.filter((_, i) => i !== idx))} style={{ marginLeft: 6 }}>
+                              <Text style={{ color: '#dc2626', fontWeight: '700', fontSize: 14 }}>✕</Text>
+                            </TouchableOpacity>
+                          </View>
+                        ))}
                       </View>
 
-                      {/* Custom times display */}
-                      {editCustomTimes.length > 0 && (
-                        <View style={{ marginBottom: 12 }}>
-                          <Text style={{ fontSize: 12, fontWeight: '600', color: '#333', marginBottom: 6 }}>Custom Times</Text>
-                          {editCustomTimes.map((time, idx) => (
-                            <View key={idx} style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 8, backgroundColor: '#dbeafe', borderRadius: 6, marginBottom: 4 }}>
-                              <Text style={{ fontSize: 12, color: '#1e40af', fontWeight: '600' }}>{time}</Text>
-                              <TouchableOpacity onPress={() => setEditCustomTimes(t => t.filter((_, i) => i !== idx))}>
-                                <Text style={{ color: '#dc2626', fontWeight: '700', fontSize: 14 }}>✕</Text>
-                              </TouchableOpacity>
-                            </View>
-                          ))}
-                        </View>
-                      )}
+                      <Text style={styles.modalLabel}>Add Specific Time (HH:MM)</Text>
+                      <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                        <TextInput
+                          value={editNewCustomTime}
+                          onChangeText={setEditNewCustomTime}
+                          style={[styles.modalInput, { flex: 1, marginBottom: 0 }]}
+                          placeholder="e.g., 14:30"
+                        />
+                        <TouchableOpacity
+                          style={[styles.modalBtn, styles.modalSave, { marginLeft: 0, paddingHorizontal: 14 }]}
+                          onPress={() => {
+                            const value = editNewCustomTime.trim();
+                            if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(value)) {
+                              Alert.alert('Invalid Time', 'Please enter time in HH:MM format.');
+                              return;
+                            }
+                            if (!editCustomTimes.includes(value)) {
+                              setEditCustomTimes(prev => [...prev, value].sort());
+                            }
+                            setEditNewCustomTime('');
+                          }}
+                        >
+                          <Text style={[styles.modalBtnText, { color: '#fff' }]}>Add</Text>
+                        </TouchableOpacity>
+                      </View>
                     </>
                   )}
                 </>
@@ -1405,6 +2673,14 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
               />
 
               {/* Start/End Dates */}
+              <Text style={styles.modalLabel}>Start Time</Text>
+              <TextInput
+                value={editStartTime}
+                onChangeText={(v) => setEditStartTime(v)}
+                style={styles.modalInput}
+                placeholder="HH:MM"
+              />
+
               <TouchableOpacity 
                 style={[styles.modalInput, { paddingVertical: 12, justifyContent: 'center', backgroundColor: '#f9fafb' }]}
                 onPress={openEditStartDatePicker}
@@ -1414,14 +2690,76 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
                 </Text>
               </TouchableOpacity>
 
-              <TouchableOpacity 
-                style={[styles.modalInput, { paddingVertical: 12, justifyContent: 'center', backgroundColor: '#f9fafb' }]}
-                onPress={openEditEndDatePicker}
-              >
-                <Text style={{ color: editEndDate ? '#000' : '#999', fontSize: 13 }}>
-                  End date: {editEndDate || 'Optional'}
-                </Text>
-              </TouchableOpacity>
+              {!editPrn && editCourseType === 'short-term' && (
+                <TouchableOpacity 
+                  style={[styles.modalInput, { paddingVertical: 12, justifyContent: 'center', backgroundColor: '#f9fafb' }]}
+                  onPress={openEditEndDatePicker}
+                >
+                  <Text style={{ color: editEndDate ? '#000' : '#999', fontSize: 13 }}>
+                    End date: {editEndDate || 'Required for short-term'}
+                  </Text>
+                </TouchableOpacity>
+              )}
+
+              <View style={{ marginBottom: 8, borderWidth: 1, borderColor: '#e2e8f0', backgroundColor: '#f8fafc', borderRadius: 8, padding: 10 }}>
+                <TouchableOpacity
+                  style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}
+                  onPress={() => {
+                    const next = !editHasScriptRepeats;
+                    setEditHasScriptRepeats(next);
+                    if (!next) {
+                      setEditScriptRepeatsCount('');
+                      setEditPrescriptionFileUri('');
+                      setEditScriptLocation('');
+                      setEditScriptLocationOtherDetail('');
+                    }
+                  }}
+                >
+                  <View style={{ width: 18, height: 18, borderWidth: 2, borderColor: '#3b82f6', borderRadius: 4, justifyContent: 'center', alignItems: 'center', marginRight: 10, backgroundColor: editHasScriptRepeats ? '#3b82f6' : '#fff' }}>
+                    {editHasScriptRepeats && <Text style={{ color: '#fff', fontSize: 11, fontWeight: 'bold' }}>✓</Text>}
+                  </View>
+                  <Text style={{ fontSize: 13, fontWeight: '600', color: '#334155' }}>This medication has script repeats</Text>
+                </TouchableOpacity>
+
+                {editHasScriptRepeats && (
+                  <>
+                    <Text style={styles.modalLabel}>Number of script repeats (optional)</Text>
+                    <TextInput
+                      value={editScriptRepeatsCount}
+                      onChangeText={(v) => setEditScriptRepeatsCount(v.replace(/[^0-9]/g, ''))}
+                      style={styles.modalInput}
+                      placeholder="e.g., 5"
+                      keyboardType="number-pad"
+                    />
+
+                    <Text style={styles.modalLabel}>Script location (if known)</Text>
+                    <TouchableOpacity
+                      style={[styles.modalInput, { justifyContent: 'center' }]}
+                      onPress={() => setShowEditScriptLocationDropdown(true)}
+                    >
+                      <Text style={{ fontSize: 13, color: '#334155' }}>{editScriptLocation || 'Select script location'}</Text>
+                    </TouchableOpacity>
+
+                    {editScriptLocation === 'Other' && (
+                      <TextInput
+                        value={editScriptLocationOtherDetail}
+                        onChangeText={setEditScriptLocationOtherDetail}
+                        style={styles.modalInput}
+                        placeholder="Please specify"
+                      />
+                    )}
+
+                    <TouchableOpacity
+                      style={[styles.modalInput, { justifyContent: 'center', backgroundColor: editPrescriptionFileUri ? '#ecfdf5' : '#f9fafb', borderColor: editPrescriptionFileUri ? '#22c55e' : '#e5e7eb' }]}
+                      onPress={pickEditPrescriptionFile}
+                    >
+                      <Text style={{ color: editPrescriptionFileUri ? '#15803d' : '#334155', fontWeight: '600' }}>
+                        {editPrescriptionFileUri ? '✓ Prescription file uploaded' : '+ Upload prescription file (optional)'}
+                      </Text>
+                    </TouchableOpacity>
+                  </>
+                )}
+              </View>
               
               {/* Stock level (read-only) */}
               <View style={[styles.modalInput, { backgroundColor: '#f0fdf4', borderWidth: 1, borderColor: '#86efac', paddingVertical: 12, justifyContent: 'center' }]}>
@@ -1446,6 +2784,128 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
             </View>
           </View>
         </View>
+      </Modal>
+
+      {/* Edit Start Date Picker Modal */}
+      <Modal visible={showEditSecondUnitDropdown} transparent animationType="fade" onRequestClose={() => setShowEditSecondUnitDropdown(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { width: '70%', maxWidth: 320, maxHeight: 360 }]}> 
+            <Text style={styles.modalTitle}>Select Second Unit</Text>
+            <ScrollView showsVerticalScrollIndicator={false}>
+              {MED_UNITS.map((u) => (
+                <TouchableOpacity
+                  key={u}
+                  style={{
+                    paddingVertical: 10,
+                    paddingHorizontal: 12,
+                    borderRadius: 8,
+                    marginBottom: 8,
+                    borderWidth: 1,
+                    borderColor: (editMed?.dosePerTablet2Unit || editMed?.unit || 'mg') === u ? '#2563eb' : '#e5e7eb',
+                    backgroundColor: (editMed?.dosePerTablet2Unit || editMed?.unit || 'mg') === u ? '#dbeafe' : '#fff'
+                  }}
+                  onPress={() => {
+                    setEditMed(m => m ? { ...m, dosePerTablet2Unit: u } : m);
+                    setShowEditSecondUnitDropdown(false);
+                  }}
+                >
+                  <Text style={{ fontSize: 13, fontWeight: '600', color: (editMed?.dosePerTablet2Unit || editMed?.unit || 'mg') === u ? '#1d4ed8' : '#334155' }}>{u}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+            <TouchableOpacity
+              style={[styles.modalBtn, styles.modalCancel, { marginTop: 8 }]}
+              onPress={() => setShowEditSecondUnitDropdown(false)}
+            >
+              <Text style={styles.modalBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={showEditScriptLocationDropdown} transparent animationType="fade" onRequestClose={() => setShowEditScriptLocationDropdown(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { width: '70%', maxWidth: 340, maxHeight: 360 }]}> 
+            <Text style={styles.modalTitle}>Select Script Location</Text>
+            <ScrollView showsVerticalScrollIndicator={false}>
+              {SCRIPT_LOCATIONS.map((location) => (
+                <TouchableOpacity
+                  key={location}
+                  style={{
+                    paddingVertical: 10,
+                    paddingHorizontal: 12,
+                    borderRadius: 8,
+                    marginBottom: 8,
+                    borderWidth: 1,
+                    borderColor: editScriptLocation === location ? '#2563eb' : '#e5e7eb',
+                    backgroundColor: editScriptLocation === location ? '#dbeafe' : '#fff'
+                  }}
+                  onPress={() => {
+                    setEditScriptLocation(location);
+                    setShowEditScriptLocationDropdown(false);
+                  }}
+                >
+                  <Text style={{ fontSize: 13, fontWeight: '600', color: editScriptLocation === location ? '#1d4ed8' : '#334155' }}>{location}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+            <TouchableOpacity
+              style={[styles.modalBtn, styles.modalCancel, { marginTop: 8 }]}
+              onPress={() => setShowEditScriptLocationDropdown(false)}
+            >
+              <Text style={styles.modalBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={showEditSlotsDropdown} transparent animationType="fade" onRequestClose={() => setShowEditSlotsDropdown(false)}>
+        <TouchableOpacity style={styles.modalOverlay} onPress={() => setShowEditSlotsDropdown(false)} activeOpacity={1}>
+          <View style={[styles.modalContent, { width: '80%', maxWidth: 380 }]}>
+            <Text style={styles.modalTitle}>Select Times</Text>
+            <TouchableOpacity style={{ paddingVertical: 10 }} onPress={() => setSlots(s => ({ ...s, beforeBreakfast: !s.beforeBreakfast }))}>
+              <Text style={{ fontSize: 13, color: '#334155' }}>Before Breakfast (05:00-10:00) {slots.beforeBreakfast ? '✓' : ''}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={{ paddingVertical: 10 }} onPress={() => setSlots(s => ({ ...s, breakfast: !s.breakfast }))}>
+              <Text style={{ fontSize: 13, color: '#334155' }}>Breakfast (06:00-10:00) {slots.breakfast ? '✓' : ''}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={{ paddingVertical: 10 }} onPress={() => setSlots(s => ({ ...s, lunch: !s.lunch }))}>
+              <Text style={{ fontSize: 13, color: '#334155' }}>Lunch (10:00-15:00) {slots.lunch ? '✓' : ''}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={{ paddingVertical: 10 }} onPress={() => setSlots(s => ({ ...s, dinner: !s.dinner }))}>
+              <Text style={{ fontSize: 13, color: '#334155' }}>Dinner (16:00-22:00) {slots.dinner ? '✓' : ''}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={{ paddingVertical: 10 }} onPress={() => setSlots(s => ({ ...s, beforeBed: !s.beforeBed }))}>
+              <Text style={{ fontSize: 13, color: '#334155' }}>Before Bed (18:00-23:59) {slots.beforeBed ? '✓' : ''}</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
+      <Modal visible={showEditFrequencyDropdown} transparent animationType="fade" onRequestClose={() => setShowEditFrequencyDropdown(false)}>
+        <TouchableOpacity style={styles.modalOverlay} onPress={() => setShowEditFrequencyDropdown(false)} activeOpacity={1}>
+          <View style={[styles.modalContent, { width: '75%', maxWidth: 340 }]}> 
+            <Text style={styles.modalTitle}>Select Frequency</Text>
+            {[
+              { key: 'daily', label: 'Every Day' },
+              { key: 'every-second-day', label: 'Every Second Day' },
+              { key: 'weekly', label: 'Weekly' },
+              { key: 'fortnightly', label: 'Fortnightly' },
+              { key: 'monthly', label: 'Monthly' },
+            ].map(freq => (
+              <TouchableOpacity
+                key={freq.key}
+                style={{ paddingVertical: 10 }}
+                onPress={() => {
+                  setEditFrequencyType(freq.key as any);
+                  setShowEditFrequencyDropdown(false);
+                }}
+              >
+                <Text style={{ fontSize: 13, color: '#334155' }}>{freq.label} {editFrequencyType === freq.key ? '✓' : ''}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </TouchableOpacity>
       </Modal>
 
       {/* Edit Start Date Picker Modal */}
@@ -1793,6 +3253,17 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
             <TextInput value={clientDraft.gpClinic} onChangeText={(v) => setClientDraft(d => ({ ...d, gpClinic: v }))} style={styles.modalInput} placeholder="GP Clinic (optional)" />
               <TextInput value={clientDraft.medicareNumber} onChangeText={(v) => setClientDraft(d => ({ ...d, medicareNumber: v }))} style={styles.modalInput} placeholder="Medicare Number (optional)" />
               <TextInput value={clientDraft.allergies} onChangeText={(v) => setClientDraft(d => ({ ...d, allergies: v }))} style={[styles.modalInput, styles.multilineInput]} placeholder="Allergies" multiline />
+              <TextInput value={clientDraft.additionalInfo} onChangeText={(v) => setClientDraft(d => ({ ...d, additionalInfo: v }))} style={[styles.modalInput, styles.multilineInput]} placeholder="Additional Information (optional)" multiline />
+
+              <Text style={styles.modalLabel}>Location *</Text>
+              <TouchableOpacity
+                style={[styles.modalInput, { justifyContent: 'center' }]}
+                onPress={() => setShowEditClientLocationDropdown(true)}
+              >
+                <Text style={{ fontSize: 13, color: '#334155', fontWeight: '600' }}>
+                  {availableClientLocations.find(l => l.id === editClientLocationId)?.name || 'Select location'}
+                </Text>
+              </TouchableOpacity>
             </ScrollView>
             
             <View style={styles.modalActions}>
@@ -1810,7 +3281,81 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
         </View>
       </Modal>
 
+      <Modal visible={showEditClientLocationDropdown} transparent animationType="fade" onRequestClose={() => setShowEditClientLocationDropdown(false)}>
+        <TouchableOpacity style={styles.modalOverlay} onPress={() => setShowEditClientLocationDropdown(false)} activeOpacity={1}>
+          <View style={[styles.modalContent, { maxHeight: 420 }]} onStartShouldSetResponder={() => true}>
+            <Text style={styles.modalTitle}>Select Location</Text>
+            <FlatList
+              data={availableClientLocations}
+              keyExtractor={(item) => item.id}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={[
+                    {
+                      backgroundColor: '#fff',
+                      borderRadius: 8,
+                      marginBottom: 6,
+                      paddingHorizontal: 12,
+                      paddingVertical: 10,
+                      borderWidth: 1,
+                      borderColor: '#e5e7eb',
+                    },
+                    editClientLocationId === item.id && {
+                      backgroundColor: '#dbeafe',
+                      borderColor: '#2563eb',
+                    },
+                  ]}
+                  onPress={() => {
+                    setEditClientLocationId(item.id);
+                    setShowEditClientLocationDropdown(false);
+                  }}
+                >
+                  <Text
+                    style={[
+                      { fontSize: 13, color: '#0f172a', fontWeight: '600' },
+                      editClientLocationId === item.id && { color: '#1d4ed8', fontWeight: '700' },
+                    ]}
+                  >
+                    {item.name}
+                  </Text>
+                </TouchableOpacity>
+              )}
+            />
+            <View style={[styles.modalActions, { marginTop: 10 }]}>
+              <TouchableOpacity style={[styles.modalBtn, styles.modalCancel]} onPress={() => setShowEditClientLocationDropdown(false)}>
+                <Text style={styles.modalBtnText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
       {/* Add Medication Modal */}
+      <Modal visible={showAddMedicationPrompt} transparent animationType="fade" onRequestClose={() => setShowAddMedicationPrompt(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxWidth: 520 }]}> 
+            <Text style={styles.modalTitle}>Before Adding Medication</Text>
+            <Text style={{ fontSize: 13, color: '#374151', lineHeight: 20, marginBottom: 12 }}>
+              Please use the information on the medication box to assist you in filling out the fields accurately.
+            </Text>
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={[styles.modalBtn, styles.modalCancel]} onPress={() => setShowAddMedicationPrompt(false)}>
+                <Text style={styles.modalBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalSave]}
+                onPress={() => {
+                  setShowAddMedicationPrompt(false);
+                  setShowAddMedication(true);
+                }}
+              >
+                <Text style={[styles.modalBtnText, { color: '#fff' }]}>I Understand</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {locationId && localClient && (
         <AddMedicationModal 
           visible={showAddMedication} 
@@ -1976,34 +3521,6 @@ export default function ClientDetailsPanel({ client, locationId, navigation, onC
         }}
       />
 
-      {/* PRN Warning Modal */}
-      <Modal visible={showPrnWarning} transparent animationType="fade">
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)' }}>
-          <View style={{ backgroundColor: '#fff', borderRadius: 12, padding: 24, width: '85%', maxWidth: 400, elevation: 5 }}>
-            <Text style={{ fontSize: 16, fontWeight: '700', color: '#dc2626', marginBottom: 8 }}>⚠️ PRN Dose Limit</Text>
-            <Text style={{ fontSize: 13, color: '#666', lineHeight: 20, marginBottom: 24 }}>
-              {prnWarningMessage}
-            </Text>
-      <View style={{ flexDirection: 'row', gap: 12 }}>
-              <TouchableOpacity 
-                style={{ flex: 1, paddingVertical: 12, borderRadius: 6, backgroundColor: '#e5e7eb', justifyContent: 'center', alignItems: 'center' }}
-                onPress={() => setShowPrnWarning(false)}
-              >
-                <Text style={{ fontSize: 14, fontWeight: '600', color: '#1f2937' }}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={{ flex: 1, paddingVertical: 12, borderRadius: 6, backgroundColor: '#2563eb', justifyContent: 'center', alignItems: 'center' }}
-                onPress={() => {
-                  setShowPrnWarning(false);
-                  saveAdministrationRecord(true);
-                }}
-              >
-                <Text style={{ fontSize: 13, fontWeight: '600', color: '#fff' }}>Record Anyway</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
@@ -2019,8 +3536,8 @@ const styles = StyleSheet.create({
   clientMeta: { color: '#475569', fontSize: 12, fontWeight: '600' },
   clientEmail: { color: '#0f4a7a', fontSize: 11, marginTop: 3, fontWeight: '600' },
   headerActionsRow: { flexDirection: 'row', alignItems: 'center' },
-  tabRow: { flexDirection: 'row', justifyContent: 'center', gap: 0, paddingHorizontal: 16, paddingVertical: 5, backgroundColor: '#e5e7eb', borderRadius: 10, borderWidth: 1, borderColor: '#e5e7eb', marginHorizontal: 16, marginTop: 12 },
-  tabButton: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 8, backgroundColor: '#e5e7eb', borderWidth: 0, flex: 1, alignItems: 'center' },
+  tabRow: { flexDirection: 'row', justifyContent: 'center', gap: 0, paddingHorizontal: 16, paddingVertical: 3, backgroundColor: '#e5e7eb', borderRadius: 10, borderWidth: 1, borderColor: '#e5e7eb', marginHorizontal: 16, marginTop: 12 },
+  tabButton: { paddingHorizontal: 16, paddingVertical: 6, borderRadius: 8, backgroundColor: '#e5e7eb', borderWidth: 0, flex: 1, alignItems: 'center' },
   tabButtonActive: { backgroundColor: '#f5fcff', borderColor: '#f5fcff' },
   tabText: { color: '#000000', fontWeight: '700', fontSize: 15 },
   tabTextActive: { color: '#000000', fontSize: 15, fontWeight: '700' },
@@ -2061,17 +3578,35 @@ const styles = StyleSheet.create({
   timelineActionBtn: { width: 36, height: 36, borderRadius: 18, justifyContent: 'center', alignItems: 'center' },
   timelineActionText: { color: '#fff', fontWeight: '700', fontSize: 14 },
   // Larger timeline card styles
-  timelineCardLarge: { padding: 14, borderRadius: 12, backgroundColor: '#fff', marginBottom: 12, borderLeftWidth: 6, borderLeftColor: '#2563eb', shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 6, elevation: 2 },
-  timelineStatusBadgeLarge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
+  timelineCardLarge: { position: 'relative', padding: 10, borderRadius: 12, backgroundColor: '#fff', marginBottom: 8, borderLeftWidth: 6, borderLeftColor: '#2563eb', shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 6, elevation: 2 },
+  timelineStatusBadgeLarge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, position: 'relative', zIndex: 3 },
   timelineStatusLabelLarge: { color: '#fff', fontWeight: '700', fontSize: 11, textAlign: 'center' },
   timelineContentLarge: { flex: 1 },
-  timelineHeaderLarge: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, gap: 8 },
+  timelineHeaderLarge: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3, gap: 6 },
   timelineDateLarge: { fontSize: 14, fontWeight: '700', color: '#2563eb' },
   timelineTimeLarge: { fontSize: 12, color: '#999', fontWeight: '600' },
-  timelineReasonLarge: { fontSize: 11, color: '#b45309', fontWeight: '600', marginTop: 2 },
-  timelineMedNameLarge: { fontSize: 14, fontWeight: '700', color: '#333', marginBottom: 4 },
-  timelineDoseLarge: { fontSize: 13, color: '#666', marginTop: 2, marginBottom: 4 },
-  timelineClickHint: { fontSize: 11, color: '#2563eb', fontWeight: '600', marginTop: 2 },
+  timelineTimeInline: { fontSize: 11, color: '#9ca3af', fontWeight: '600' },
+  timelineReasonLarge: { fontSize: 11, color: '#b45309', fontWeight: '600', marginTop: 1 },
+  timelineMedNameLarge: { fontSize: 14, fontWeight: '700', color: '#333', marginBottom: 1 },
+  timelineDoseLarge: { fontSize: 13, color: '#666', marginTop: 1, marginBottom: 2 },
+  timelineClickHint: { fontSize: 10, color: '#2563eb', fontWeight: '600', marginTop: 1 },
+  timelineHoverHintBubble: { position: 'absolute', top: -34, left: '50%', transform: [{ translateX: -92 }], zIndex: 20, backgroundColor: '#2563eb', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, minWidth: 184, alignItems: 'center' },
+  timelineHoverHintText: { color: '#eff6ff', fontSize: 11, fontWeight: '600', textAlign: 'center' },
+  timelineHoverHintPointer: { position: 'absolute', bottom: -6, left: '50%', marginLeft: -6, width: 0, height: 0, borderLeftWidth: 6, borderRightWidth: 6, borderTopWidth: 6, borderLeftColor: 'transparent', borderRightColor: 'transparent', borderTopColor: '#2563eb' },
+  timelineMultiSelectRowUnderPrompt: { marginTop: 6, alignItems: 'flex-start' },
+  timelineMultiSelectStacked: { position: 'absolute', top: 32, right: 0, minWidth: 70, minHeight: 30, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: '#bfdbfe', borderRadius: 6, backgroundColor: '#f8fbff' },
+  timelineMultiSelectButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-start', paddingHorizontal: 6, paddingVertical: 5, borderWidth: 1, borderColor: '#bfdbfe', borderRadius: 6, backgroundColor: '#f8fbff' },
+  timelineMultiSelectCheckbox: { width: 18, height: 18, borderRadius: 5, borderWidth: 2, borderColor: '#93c5fd', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
+  timelineMultiSelectCheckboxChecked: { backgroundColor: '#2563eb', borderColor: '#2563eb' },
+  timelineMultiSelectCheckmark: { color: '#fff', fontSize: 10, fontWeight: '800' },
+  timelineMultiSelectLabel: { marginLeft: 6, fontSize: 9, fontWeight: '700', color: '#1d4ed8' },
+  timelineMultiSelectBar: { marginHorizontal: 12, marginTop: 10, marginBottom: 2, backgroundColor: '#eff6ff', borderColor: '#bfdbfe', borderWidth: 1, borderRadius: 10, padding: 10, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  timelineMultiSelectTitle: { fontSize: 12, fontWeight: '800', color: '#1e3a8a', marginBottom: 2 },
+  timelineMultiSelectSummary: { fontSize: 11, color: '#1d4ed8', fontWeight: '600' },
+  timelineMultiSelectAction: { backgroundColor: '#2563eb', borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10 },
+  timelineMultiSelectActionText: { color: '#fff', fontSize: 11, fontWeight: '700' },
+  timelineMultiSelectClear: { borderRadius: 8, paddingVertical: 8, paddingHorizontal: 8, borderWidth: 1, borderColor: '#93c5fd', backgroundColor: '#fff' },
+  timelineMultiSelectClearText: { color: '#1e40af', fontSize: 11, fontWeight: '700' },
   historyRow: { padding: 12, borderRadius: 8, backgroundColor: '#f9fafb', marginBottom: 8, borderWidth: 1, borderColor: '#e5e7eb' },
 
   // modal
@@ -2091,6 +3626,7 @@ const styles = StyleSheet.create({
   slotText: { fontWeight: '600', color: '#244' },
   slotTextActive: { color: '#1e40af' },
   slotTime: { color: '#889', fontSize: 11, marginTop: 6 },
+  slotTag: { fontSize: 11, color: '#1e40af', fontWeight: '600' },
   scheduleTypeButton: { flex: 1, borderWidth: 1.5, borderColor: '#e5e7eb', backgroundColor: '#f9fafb', borderRadius: 8, paddingVertical: 10, paddingHorizontal: 8, alignItems: 'center' },
   scheduleTypeButtonActive: { backgroundColor: '#dbeafe', borderColor: '#2563eb' },
   scheduleTypeButtonText: { fontSize: 12, fontWeight: '700', color: '#666', marginBottom: 2 },

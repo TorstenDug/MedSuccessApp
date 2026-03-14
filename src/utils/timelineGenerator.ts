@@ -16,6 +16,7 @@ export type TimelineDisplayItem = {
  */
 export function generateTimelineDisplayItems(meds: Medication[]): TimelineDisplayItem[] {
   const now = Date.now();
+  const sevenDaysAhead = now + 7 * 24 * 60 * 60 * 1000;
   const ninetyDaysAhead = now + 90 * 24 * 60 * 60 * 1000;
 
   const startOfDay = (time: number) => {
@@ -40,8 +41,30 @@ export function generateTimelineDisplayItems(meds: Medication[]): TimelineDispla
     return Math.min(...parsed);
   };
 
+  const toLocalSlotKey = (iso: string): string => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return [
+      d.getFullYear(),
+      d.getMonth(),
+      d.getDate(),
+      d.getHours(),
+      d.getMinutes(),
+    ].join('-');
+  };
+
   return meds
     .flatMap(m => {
+      const parsedEndTime = m.endTime ? new Date(m.endTime).getTime() : undefined;
+      const hasEndDate = parsedEndTime !== undefined && Number.isFinite(parsedEndTime);
+      const isShortTerm = m.courseType === 'short-term';
+      const baseFutureHorizon = hasEndDate || isShortTerm ? ninetyDaysAhead : sevenDaysAhead;
+      const futureHorizon = m.frequencyType === 'fortnightly'
+        ? Math.max(baseFutureHorizon, now + 14 * 24 * 60 * 60 * 1000)
+        : m.frequencyType === 'monthly'
+          ? Math.max(baseFutureHorizon, now + 32 * 24 * 60 * 60 * 1000)
+          : baseFutureHorizon;
+
       const medStartCandidates = [
         m.startTime ? new Date(m.startTime).getTime() : undefined,
         earliestScheduledBaseTime(m)
@@ -51,8 +74,8 @@ export function generateTimelineDisplayItems(meds: Medication[]): TimelineDispla
       const generationStart = startOfDay(medStartTime);
       const generationEnd = endOfDay(
         Math.min(
-          m.endTime ? new Date(m.endTime).getTime() : Number.MAX_SAFE_INTEGER,
-          ninetyDaysAhead
+          hasEndDate ? parsedEndTime! : Number.MAX_SAFE_INTEGER,
+          futureHorizon
         )
       );
 
@@ -60,29 +83,45 @@ export function generateTimelineDisplayItems(meds: Medication[]): TimelineDispla
         return [];
       }
 
-      // Handle interval-based medications (every-second-day, weekly, fortnightly)
+      // Handle interval-based medications (every-second-day, weekly, fortnightly, monthly)
       if (m.frequencyType && m.frequencyType !== 'daily' && m.startTime) {
         const startDate = new Date(m.startTime);
         startDate.setHours(0, 0, 0, 0);
         const generatedTimes: string[] = [];
-        const intervalDays = m.frequencyType === 'every-second-day' ? 2 : m.frequencyType === 'weekly' ? 7 : 14;
+        const intervalDays = m.frequencyType === 'every-second-day' ? 2 : m.frequencyType === 'weekly' ? 7 : m.frequencyType === 'fortnightly' ? 14 : undefined;
 
         if (startDate.getTime() > generationEnd.getTime()) {
           return [];
         }
 
-        const firstInstance = new Date(startDate);
-        while (firstInstance.getTime() < generationStart.getTime()) {
-          firstInstance.setDate(firstInstance.getDate() + intervalDays);
-        }
+        if (m.frequencyType === 'monthly') {
+          const firstInstance = new Date(startDate);
+          while (firstInstance.getTime() < generationStart.getTime()) {
+            firstInstance.setMonth(firstInstance.getMonth() + 1);
+          }
 
-        const cursor = new Date(firstInstance);
-        while (cursor.getTime() <= generationEnd.getTime()) {
-          const instanceDate = new Date(cursor);
-          // Set to 00:00 for all-day "due" status
-          instanceDate.setHours(0, 0, 0, 0);
-          generatedTimes.push(instanceDate.toISOString());
-          cursor.setDate(cursor.getDate() + intervalDays);
+          const cursor = new Date(firstInstance);
+          while (cursor.getTime() <= generationEnd.getTime()) {
+            const instanceDate = new Date(cursor);
+            // Set to 00:00 for all-day "due" status
+            instanceDate.setHours(0, 0, 0, 0);
+            generatedTimes.push(instanceDate.toISOString());
+            cursor.setMonth(cursor.getMonth() + 1);
+          }
+        } else {
+          const firstInstance = new Date(startDate);
+          while (firstInstance.getTime() < generationStart.getTime()) {
+            firstInstance.setDate(firstInstance.getDate() + (intervalDays || 0));
+          }
+
+          const cursor = new Date(firstInstance);
+          while (cursor.getTime() <= generationEnd.getTime()) {
+            const instanceDate = new Date(cursor);
+            // Set to 00:00 for all-day "due" status
+            instanceDate.setHours(0, 0, 0, 0);
+            generatedTimes.push(instanceDate.toISOString());
+            cursor.setDate(cursor.getDate() + (intervalDays || 0));
+          }
         }
 
         return generatedTimes.map(t => {
@@ -124,12 +163,29 @@ export function generateTimelineDisplayItems(meds: Medication[]): TimelineDispla
     .filter((item) => {
       const t = new Date(item.time).getTime();
 
-      if (t > ninetyDaysAhead) return false;
+      const parsedEndTime = item.med.endTime ? new Date(item.med.endTime).getTime() : undefined;
+      const hasEndDate = parsedEndTime !== undefined && Number.isFinite(parsedEndTime);
+      const isShortTerm = item.med.courseType === 'short-term';
+      const futureHorizon = hasEndDate || isShortTerm ? ninetyDaysAhead : sevenDaysAhead;
+
+      if (t > futureHorizon) return false;
       
       // Check if time is before medication start date
       if (item.med.startTime) {
         const startTime = new Date(item.med.startTime).getTime();
-        if (t < startTime) return false;
+        const isIntervalSchedule = !!item.med.frequencyType && item.med.frequencyType !== 'daily';
+        const isDailySchedule = !item.med.frequencyType || item.med.frequencyType === 'daily';
+        const hasScheduledTimes = (item.med.scheduledTimes || []).length > 0;
+
+        if ((isDailySchedule && hasScheduledTimes) || isIntervalSchedule) {
+          const startDate = new Date(item.med.startTime);
+          startDate.setHours(0, 0, 0, 0);
+          const itemDate = new Date(item.time);
+          itemDate.setHours(0, 0, 0, 0);
+          if (itemDate.getTime() < startDate.getTime()) return false;
+        } else {
+          if (t < startTime) return false;
+        }
       }
       
       if (item.med.endTime) {
@@ -145,38 +201,41 @@ export function generateTimelineDisplayItems(meds: Medication[]): TimelineDispla
       scheduleDate.setHours(0, 0, 0, 0);
       const scheduleDateTime = scheduleDate.getTime();
 
+      const scheduleSlotKey = toLocalSlotKey(item.time);
+      const hasActionedRecordForSlot = (item.med.administrationRecords || []).some(r => {
+        if (!(r.status === 'given' || r.status === 'missed')) return false;
+        if (!scheduleSlotKey) return false;
+        return toLocalSlotKey(r.time) === scheduleSlotKey;
+      });
+
+      const givenRecordAtTime = (item.med.administrationRecords || []).find(
+        r => r.time === item.time && r.status === 'given'
+      );
+      const givenRecordDayTime = givenRecordAtTime
+        ? (() => {
+            const d = new Date(givenRecordAtTime.actualTime || givenRecordAtTime.time);
+            d.setHours(0, 0, 0, 0);
+            return d.getTime();
+          })()
+        : undefined;
+      const isScheduledForToday = scheduleDateTime === todayTime;
+
+      // Preserve today's given entries only when they are scheduled for today.
+      // This prevents past-day overdue doses recorded late from lingering as "Given" in timeline.
+      if (item.status === 'given' && isScheduledForToday && givenRecordDayTime === todayTime) {
+        return true;
+      }
+
       // For medications from previous days, only show if they're due, overdue, or missed
       if (scheduleDateTime < todayTime) {
-        // Only show if status is due, overdue, or missed
-        if (!['due', 'overdue', 'missed'].includes(item.status)) {
+        // Once a previous-day dose has been actioned, keep it in history only.
+        if (hasActionedRecordForSlot) {
           return false;
         }
 
-        // Hide manually recorded "not given" entries from previous days
-        // (e.g. refused, out-of-stock, schedule-conflict). Keep only potential
-        // auto-missed entries that have no reason text.
-        if (item.status === 'missed') {
-          const missedRecordsAtTime = (item.med.administrationRecords || []).filter(
-            r => r.time === item.time && r.status === 'missed'
-          );
-
-          const hasManualNotGivenReason = missedRecordsAtTime.some(r => {
-            const reasonText = (r.reason || '').toLowerCase().trim();
-            if (!reasonText) return false;
-
-            return (
-              reasonText.includes('marked as not given:') ||
-              reasonText.includes('reason: refused') ||
-              reasonText.includes('reason: out-of-stock') ||
-              reasonText.includes('reason: schedule-conflict') ||
-              reasonText.includes('reason: other') ||
-              reasonText.includes('reason:')
-            );
-          });
-
-          if (hasManualNotGivenReason) {
-            return false;
-          }
+        // Only show if status is due, overdue, or missed
+        if (!['due', 'overdue', 'missed'].includes(item.status)) {
+          return false;
         }
 
         return true;
@@ -185,6 +244,23 @@ export function generateTimelineDisplayItems(meds: Medication[]): TimelineDispla
       return true;
     })
     .sort((a, b) => {
+      const isDueAnyTimeToday = (item: TimelineDisplayItem) => {
+        if (item.status !== 'due') return false;
+        const d = new Date(item.time);
+        const nowDate = new Date();
+        return (
+          d.getFullYear() === nowDate.getFullYear() &&
+          d.getMonth() === nowDate.getMonth() &&
+          d.getDate() === nowDate.getDate() &&
+          d.getHours() === 0 &&
+          d.getMinutes() === 0
+        );
+      };
+
+      const aDueAnyToday = isDueAnyTimeToday(a);
+      const bDueAnyToday = isDueAnyTimeToday(b);
+      if (aDueAnyToday !== bDueAnyToday) return aDueAnyToday ? -1 : 1;
+
       const ta = new Date(a.time).getTime();
       const tb = new Date(b.time).getTime();
       const aPast = ta <= now;

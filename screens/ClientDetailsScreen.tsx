@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, FlatList, SafeAreaView } from 'react-native';
-import { loadData, Location, Client, Medication, updateClient } from '../src/storage';
+import { loadData, Client } from '../src/storage';
 
 function timelineStatusFromTime(timeIso: string) {
   const now = new Date();

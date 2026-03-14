@@ -9,6 +9,7 @@ export default function AddClientScreen({ route, navigation }: any) {
   const [name, setName] = useState('');
   const [dob, setDob] = useState('');
   const [allergies, setAllergies] = useState('');
+  const [additionalInfo, setAdditionalInfo] = useState('');
   const [photoUri, setPhotoUri] = useState('');
   const [gender, setGender] = useState<'Male' | 'Female' | 'Other' | ''>('');
   const [weight, setWeight] = useState('');
@@ -112,6 +113,7 @@ export default function AddClientScreen({ route, navigation }: any) {
         name, 
         dob, 
         allergies, 
+        additionalInfo: additionalInfo.trim() || undefined,
         medications: [],
         photoUri: photoUri || undefined,
         gender: gender ? (gender as 'Male' | 'Female' | 'Other') : undefined,
@@ -227,6 +229,19 @@ export default function AddClientScreen({ route, navigation }: any) {
             <Text style={styles.label}>Allergies *</Text>
             <TextInput placeholder="List any known allergies" value={allergies} onChangeText={setAllergies} style={[styles.input, styles.multilineInput]} multiline editable={!loading} />
             <Text style={styles.helperText}>If no allergies, enter "Nil"</Text>
+          </View>
+
+          {/* Additional Information */}
+          <View style={styles.field}>
+            <Text style={styles.label}>Additional Information (Optional)</Text>
+            <TextInput
+              placeholder="Any extra care notes or client information"
+              value={additionalInfo}
+              onChangeText={setAdditionalInfo}
+              style={[styles.input, styles.multilineInput]}
+              multiline
+              editable={!loading}
+            />
           </View>
 
           {/* Location */}
